@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@color/bg"
+    android:fitsSystemWindows="true">
+
+    <!-- Top toolbar -->
+    <HorizontalScrollView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/toolbar"
+        android:scrollbars="none"
+        android:fillViewport="true">
+
+        <LinearLayout
+            android:id="@+id/toolbar"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingLeft="8dp"
+            android:paddingRight="8dp">
+
+            <TextView
+                android:id="@+id/title"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/app_name"
+                android:textColor="@color/accent"
+                android:textStyle="bold"
+                android:textSize="14sp"
+                android:paddingRight="12dp" />
+
+            <Button
+                android:id="@+id/btn_java"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:minWidth="0dp"
+                android:paddingLeft="12dp"
+                android:paddingRight="12dp"
+                android:text="@string/action_java"
+                android:textAllCaps="false"
+                android:textSize="13sp"
+                android:textColor="@color/text"
+                android:background="@color/btn"
+                android:layout_marginEnd="6dp" />
+
+            <Button
+                android:id="@+id/btn_go"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:minWidth="0dp"
+                android:paddingLeft="12dp"
+                android:paddingRight="12dp"
+                android:text="@string/action_go"
+                android:textAllCaps="false"
+                android:textSize="13sp"
+                android:textColor="@color/text"
+                android:background="@color/btn"
+                android:layout_marginEnd="6dp" />
+
+            <Button
+                android:id="@+id/btn_undo"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:minWidth="0dp"
+                android:paddingLeft="12dp"
+                android:paddingRight="12dp"
+                android:text="@string/action_undo"
+                android:textAllCaps="false"
+                android:textSize="13sp"
+                android:textColor="@color/text"
+                android:background="@color/btn"
+                android:layout_marginEnd="6dp" />
+
+            <Button
+                android:id="@+id/btn_redo"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:minWidth="0dp"
+                android:paddingLeft="12dp"
+                android:paddingRight="12dp"
+                android:text="@string/action_redo"
+                android:textAllCaps="false"
+                android:textSize="13sp"
+                android:textColor="@color/text"
+                android:background="@color/btn"
+                android:layout_marginEnd="6dp" />
+
+            <Button
+                android:id="@+id/btn_zoom_out"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:minWidth="0dp"
+                android:paddingLeft="12dp"
+                android:paddingRight="12dp"
+                android:text="@string/action_zoom_out"
+                android:textAllCaps="false"
+                android:textSize="13sp"
+                android:textColor="@color/text"
+                android:background="@color/btn"
+                android:layout_marginEnd="6dp" />
+
+            <Button
+                android:id="@+id/btn_zoom_in"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:minWidth="0dp"
+                android:paddingLeft="12dp"
+                android:paddingRight="12dp"
+                android:text="@string/action_zoom_in"
+                android:textAllCaps="false"
+                android:textSize="13sp"
+                android:textColor="@color/text"
+                android:background="@color/btn" />
+        </LinearLayout>
+    </HorizontalScrollView>
+
+    <!-- Editor fills the rest; added in code so we don't need a custom
+         XML namespace / attr declaration for the library view. -->
+    <FrameLayout
+        android:id="@+id/editor_container"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1" />
+</LinearLayout>

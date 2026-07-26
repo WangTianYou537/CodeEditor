@@ -1,14 +1,23 @@
 # Build outputs
 /build/
+/dist/
 *.class
 *.jar
 !grammars/**
 *.war
 *.ear
+*.apk
+*.ap_
+*.dex
 
-# Android SDK / platform packages (download via ./scripts/fetch-android-platform.sh)
+# Android SDK / platform packages (download via scripts)
 /android-sdk/
 *.zip
+
+# Signing material
+*.keystore
+*.jks
+demo/debug.keystore
 
 # Compile-time Android API stubs (optional local aid; not part of the library)
 /stubs/

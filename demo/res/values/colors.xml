@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#FF1E1E2E</color>
+    <color name="toolbar">#FF181825</color>
+    <color name="accent">#FFCBA6F7</color>
+    <color name="text">#FFCDD6F4</color>
+    <color name="btn">#FF313244</color>
+</resources>

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CodeEditor Demo</string>
+    <string name="action_java">Java</string>
+    <string name="action_go">Go</string>
+    <string name="action_undo">Undo</string>
+    <string name="action_redo">Redo</string>
+    <string name="action_zoom_in">A+</string>
+    <string name="action_zoom_out">A-</string>
+</resources>
