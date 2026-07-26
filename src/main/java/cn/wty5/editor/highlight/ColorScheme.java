@@ -9,6 +9,8 @@ public class ColorScheme {
     public int foreground = 0xFFCDD6F4;
     public int caret = 0xFFF5E0DC;
     public int selection = 0x403E68D8;
+    /** Filled circle / teardrop used for selection drag handles. */
+    public int selectionHandle = 0xFF89B4FA;
     public int currentLine = 0x14FFFFFF;
     public int gutterBackground = 0xFF181825;
     public int gutterText = 0xFF6C7086;
