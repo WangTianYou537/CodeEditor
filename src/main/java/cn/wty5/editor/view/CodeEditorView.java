@@ -71,18 +71,23 @@ public class CodeEditorView extends View
     /** Which selection handle is being dragged, if any. */
     private enum Handle { NONE, START, END }
     private Handle activeHandle = Handle.NONE;
-    /**
-     * After a long-press / double-tap word select, subsequent MOVE events
-     * extend the selection end until the finger lifts.
-     */
+    /** After a long-press / double-tap word select, MOVE extends the end. */
     private boolean fingerSelecting;
+    /** Pixel slop from {@link ViewConfiguration} — pan vs tap. */
     private int touchSlop;
+    /** Larger slop used for double-tap proximity (from ViewConfiguration). */
+    private int doubleTapSlop;
+    private int doubleTapTimeoutMs;
+    private int longPressTimeoutMs;
     private float downX, downY;
-    private boolean touchMoved;
-    /** Timestamp of last plain tap UP — used for manual double-tap detection. */
+    /**
+     * True once the finger has moved far enough that this gesture is a pan,
+     * not a tap / long-press. Uses a deliberately larger threshold than
+     * {@link #touchSlop} so natural finger tremor does not kill long-press.
+     */
+    private boolean panning;
     private long lastTapUpMs;
     private float lastTapX, lastTapY;
-    /** True once a double-tap was recognised in this DOWN/UP cycle. */
     private boolean doubleTapHandled;
     private final Runnable longPressRunnable = this::onLongPressTimeout;
 
@@ -158,7 +163,20 @@ public class CodeEditorView extends View
         setWillNotDraw(false);
 
         density = context.getResources().getDisplayMetrics().density;
-        touchSlop = ViewConfiguration.get(context).getScaledTouchSlop();
+        ViewConfiguration vc = ViewConfiguration.get(context);
+        touchSlop = vc.getScaledTouchSlop();
+        // Double-tap slop is typically ~100px; fall back if hidden API shape differs.
+        doubleTapSlop = touchSlop * 4;
+        try {
+            // getScaledDoubleTapSlop has been public since API 3.
+            doubleTapSlop = vc.getScaledDoubleTapSlop();
+        } catch (Throwable ignored) {
+        }
+        doubleTapTimeoutMs = ViewConfiguration.getDoubleTapTimeout();
+        longPressTimeoutMs = ViewConfiguration.getLongPressTimeout();
+        // Floor so a very aggressive OEM timeout does not feel broken.
+        if (longPressTimeoutMs < 300) longPressTimeoutMs = 400;
+        if (doubleTapTimeoutMs < 200) doubleTapTimeoutMs = 300;
         textPaint.setTypeface(Typeface.MONOSPACE);
         textPaint.setSubpixelText(true);
         textPaint.setLinearText(true);
@@ -644,14 +662,18 @@ public class CodeEditorView extends View
 
     /** Fired from the posted long-press runnable. */
     private void onLongPressTimeout() {
-        if (suppressSingleFingerGestures || scaling || touchMoved) return;
+        if (suppressSingleFingerGestures || scaling || panning) return;
         if (activeHandle != Handle.NONE) return;
+        if (!isAttachedToWindow()) return;
         requestFocus();
-        selectWordAt(offsetForPoint(downX, downY));
+        int off = offsetForPoint(downX, downY);
+        selectWordAt(off);
         dismissCompletions();
         fingerSelecting = true;
         activeHandle = Handle.END;
-        doubleTapHandled = true; // suppress the upcoming tap-up
+        doubleTapHandled = true; // suppress the upcoming tap-up as a caret move
+        // Make sure the highlight paints even if a parent is mid-layout.
+        postInvalidate();
     }
 
     // ------------------------------------------------------------------
@@ -1177,13 +1199,20 @@ public class CodeEditorView extends View
     // Touch & scrolling
     // ------------------------------------------------------------------
 
-    private static final int DOUBLE_TAP_TIMEOUT_MS = 300;
-    private static final int LONG_PRESS_TIMEOUT_MS = 400;
+    /**
+     * Movement beyond this (before long-press fires) is treated as a pan and
+     * cancels long-press / double-tap. Kept larger than {@link #touchSlop}
+     * because real fingers jitter well past the platform touch slop during a
+     * deliberate stationary press.
+     */
+    private float tapStillSlop() {
+        return Math.max(24f * density, doubleTapSlop * 0.75f);
+    }
 
     private final Runnable singleTapRunnable = new Runnable() {
         @Override
         public void run() {
-            if (suppressSingleFingerGestures || scaling) return;
+            if (suppressSingleFingerGestures || scaling || panning) return;
             requestFocus();
             moveCaretTo(offsetForPoint(downX, downY), false);
             dismissCompletions();
@@ -1210,6 +1239,7 @@ public class CodeEditorView extends View
             cancelPendingTaps();
             activeHandle = Handle.NONE;
             fingerSelecting = false;
+            panning = false;
             return true;
         }
         if (suppressSingleFingerGestures || scaling
@@ -1227,20 +1257,19 @@ public class CodeEditorView extends View
             case MotionEvent.ACTION_DOWN: {
                 downX = x;
                 downY = y;
-                touchMoved = false;
+                panning = false;
                 doubleTapHandled = false;
                 scroller.forceFinished(true);
 
-                // A new gesture supersedes any pending single-tap from a
-                // previous UP (critical for double-tap: the 2nd DOWN must
-                // cancel the 1st tap's deferred caret-move).
+                // Cancel any pending single-tap from a previous UP so a
+                // double-tap's second DOWN is not raced by a caret move.
                 removeCallbacks(singleTapRunnable);
 
                 // Only hit-test handles when a selection is already showing.
                 Handle hit = hitTestHandle(x, y);
                 if (hit != Handle.NONE) {
                     activeHandle = hit;
-                    fingerSelecting = false;
+                    fingerSelecting = true;
                     removeCallbacks(longPressRunnable);
                     dismissCompletions();
                     return true;
@@ -1248,10 +1277,26 @@ public class CodeEditorView extends View
 
                 activeHandle = Handle.NONE;
                 fingerSelecting = false;
-                // Arm long-press; cancelled on move / up / multi-touch.
+
+                // Detect double-tap on the 2nd DOWN (not UP) so selection
+                // appears under the still-down finger and can be extended.
+                long now = android.os.SystemClock.uptimeMillis();
+                float still = tapStillSlop();
+                boolean isDouble = (now - lastTapUpMs) <= doubleTapTimeoutMs
+                        && dist2(x, y, lastTapX, lastTapY) <= still * still;
+                if (isDouble) {
+                    requestFocus();
+                    selectWordAt(offsetForPoint(x, y));
+                    dismissCompletions();
+                    fingerSelecting = true;
+                    activeHandle = Handle.END;
+                    doubleTapHandled = true;
+                    lastTapUpMs = 0;
+                    return true;
+                }
+
                 removeCallbacks(longPressRunnable);
-                postDelayed(longPressRunnable, LONG_PRESS_TIMEOUT_MS);
-                // Let GestureDetector track for scroll/fling.
+                postDelayed(longPressRunnable, longPressTimeoutMs);
                 gestureDetector.onTouchEvent(event);
                 return true;
             }
@@ -1263,11 +1308,16 @@ public class CodeEditorView extends View
                 }
                 float dx = x - downX;
                 float dy = y - downY;
-                if (!touchMoved && dx * dx + dy * dy > touchSlop * touchSlop) {
-                    touchMoved = true;
-                    cancelPendingTaps(); // no long-press / single-tap after a drag
+                float still = tapStillSlop();
+                if (!panning && dx * dx + dy * dy > still * still) {
+                    panning = true;
+                    cancelPendingTaps();
                 }
-                gestureDetector.onTouchEvent(event);
+                // Only feed the scroll detector once we are clearly panning,
+                // so micro-jitter during a press cannot start a scroll.
+                if (panning) {
+                    gestureDetector.onTouchEvent(event);
+                }
                 return true;
             }
 
@@ -1282,33 +1332,25 @@ public class CodeEditorView extends View
                     return true;
                 }
 
-                gestureDetector.onTouchEvent(event);
-
-                if (!touchMoved && !doubleTapHandled
-                        && !suppressSingleFingerGestures && !scaling) {
-                    long now = android.os.SystemClock.uptimeMillis();
-                    boolean isDouble = (now - lastTapUpMs) <= DOUBLE_TAP_TIMEOUT_MS
-                            && dist2(x, y, lastTapX, lastTapY)
-                            < (touchSlop * 4f) * (touchSlop * 4f);
-                    if (isDouble) {
-                        // Cancel the pending single-tap from the first tap.
-                        removeCallbacks(singleTapRunnable);
-                        requestFocus();
-                        selectWordAt(offsetForPoint(x, y));
-                        dismissCompletions();
-                        lastTapUpMs = 0; // don't triple-tap into another select
-                        doubleTapHandled = true;
-                    } else {
-                        // Defer single-tap so a second tap can still cancel it.
-                        downX = x;
-                        downY = y;
-                        removeCallbacks(singleTapRunnable);
-                        postDelayed(singleTapRunnable, DOUBLE_TAP_TIMEOUT_MS);
-                        lastTapUpMs = now;
-                        lastTapX = x;
-                        lastTapY = y;
-                    }
+                if (panning) {
+                    gestureDetector.onTouchEvent(event);
+                    panning = false;
+                    return true;
                 }
+
+                // Stationary tap UP → schedule single-tap; a second DOWN
+                // within doubleTapTimeoutMs cancels it and selects a word.
+                if (!doubleTapHandled && !suppressSingleFingerGestures && !scaling) {
+                    long now = android.os.SystemClock.uptimeMillis();
+                    downX = x;
+                    downY = y;
+                    removeCallbacks(singleTapRunnable);
+                    postDelayed(singleTapRunnable, doubleTapTimeoutMs);
+                    lastTapUpMs = now;
+                    lastTapX = x;
+                    lastTapY = y;
+                }
+                dispatchGestureCancel(event);
                 return true;
             }
 
@@ -1316,12 +1358,12 @@ public class CodeEditorView extends View
                 cancelPendingTaps();
                 activeHandle = Handle.NONE;
                 fingerSelecting = false;
+                panning = false;
                 gestureDetector.onTouchEvent(event);
                 return true;
             }
 
             default:
-                gestureDetector.onTouchEvent(event);
                 return true;
         }
     }
