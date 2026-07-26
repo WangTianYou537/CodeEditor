@@ -91,6 +91,18 @@ public class CodeEditorView extends View
     private float zoomFocusDocX;
     private float zoomFocusDocY;
 
+    /**
+     * Cached visible band of this view that is NOT covered by the soft
+     * keyboard (or other system windows), in view-local coordinates:
+     * {@code [imeVisibleTop, imeVisibleBottom)}. Updated from
+     * {@link #refreshImeVisibleBand()} on layout / global-layout.
+     */
+    private int imeVisibleTop;
+    private int imeVisibleBottom;
+    private final int[] locationInWindow = new int[2];
+    private final android.view.ViewTreeObserver.OnGlobalLayoutListener imeLayoutListener =
+            this::onPossibleImeLayoutChange;
+
     private final Runnable caretBlink = new Runnable() {
         @Override
         public void run() {
@@ -980,29 +992,124 @@ public class CodeEditorView extends View
     }
 
     private int maxScrollY() {
-        if (lineHeight <= 0f) return 0;
-        return (int) Math.max(0, document.lineCount() * lineHeight - getHeight() / 2f);
+        if (lineHeight <= 0f || document == null) return 0;
+        // Allow scrolling far enough that the last line can sit above the IME,
+        // not merely within the full (possibly keyboard-covered) view height.
+        int band = imeVisibleBandHeight();
+        return (int) Math.max(0, document.lineCount() * lineHeight - band / 2f);
     }
 
     private int maxScrollX() {
         return (int) Math.max(0, 200 * charWidth);
     }
 
+    /**
+     * Height of the portion of this view currently free of the soft keyboard.
+     * Falls back to {@link #getHeight()} before the first layout pass.
+     */
+    private int imeVisibleBandHeight() {
+        int h = getHeight();
+        if (h <= 0) return 0;
+        if (imeVisibleBottom > imeVisibleTop) {
+            return Math.max(1, Math.min(h, imeVisibleBottom - imeVisibleTop));
+        }
+        return h;
+    }
+
+    /**
+     * Recomputes {@link #imeVisibleTop}/{@link #imeVisibleBottom} from the
+     * window's visible display frame (the rectangle above the IME).
+     *
+     * <p>Works for both host modes:
+     * <ul>
+     *   <li>{@code adjustResize} — our height already shrank; band ≈ full height</li>
+     *   <li>{@code adjustPan} / overlay — height unchanged; band is clipped
+     *       to {@code visibleFrame.bottom} so caret scroll accounts for the IME</li>
+     * </ul>
+     *
+     * @return true if the band changed
+     */
+    private boolean refreshImeVisibleBand() {
+        int h = getHeight();
+        int w = getWidth();
+        if (h <= 0 || w <= 0 || !isAttachedToWindow()) {
+            int oldBottom = imeVisibleBottom;
+            imeVisibleTop = 0;
+            imeVisibleBottom = Math.max(0, h);
+            return oldBottom != imeVisibleBottom;
+        }
+
+        getWindowVisibleDisplayFrame(visibleFrame);
+        getLocationInWindow(locationInWindow);
+        int viewTop = locationInWindow[1];
+        int viewBottom = viewTop + h;
+
+        // Intersect view bounds with the window region not covered by the IME.
+        int uncoveredTop = Math.max(viewTop, visibleFrame.top);
+        int uncoveredBottom = Math.min(viewBottom, visibleFrame.bottom);
+
+        int top = Math.max(0, uncoveredTop - viewTop);
+        int bottom = Math.max(top, Math.min(h, uncoveredBottom - viewTop));
+
+        // If the IME reports a degenerate frame (some OEMs while animating),
+        // keep the previous band rather than collapsing to zero.
+        if (bottom - top < lineHeight && h > lineHeight) {
+            // Visible frame might still be full-screen during IME animation;
+            // only trust a shrink when it's clearly smaller than the view.
+            if (visibleFrame.height() >= h - 1) {
+                top = 0;
+                bottom = h;
+            }
+        }
+
+        if (top == imeVisibleTop && bottom == imeVisibleBottom) {
+            return false;
+        }
+        imeVisibleTop = top;
+        imeVisibleBottom = bottom;
+        return true;
+    }
+
+    /**
+     * Scrolls so the caret lies inside the IME-uncovered band of this view,
+     * with a small margin so it is not flush against the keyboard edge.
+     */
     private void ensureCaretVisible() {
-        if (lineHeight <= 0f || charWidth <= 0f || getWidth() == 0) return;
+        if (lineHeight <= 0f || charWidth <= 0f || getWidth() == 0 || document == null) {
+            return;
+        }
+        refreshImeVisibleBand();
+
         int line = document.lineOfOffset(caret);
         int col = caret - document.lineStart(line);
-        float top = line * lineHeight;
-        float bottom = top + lineHeight;
+        float caretDocTop = line * lineHeight;
+        float caretDocBottom = caretDocTop + lineHeight;
         float x = gutterWidth + col * charWidth;
 
         int sx = getScrollX();
         int sy = getScrollY();
-        if (top < sy) {
-            sy = (int) top;
-        } else if (bottom > sy + getHeight()) {
-            sy = (int) (bottom - getHeight());
+
+        // Margin inside the visible band (≈ half a line, at least 4dp) so the
+        // caret does not sit directly on the IME boundary.
+        float margin = Math.max(4f * density, lineHeight * 0.5f);
+        float bandTop = imeVisibleTop + margin;
+        float bandBottom = imeVisibleBottom - margin;
+        if (bandBottom <= bandTop) {
+            // Tiny visible strip — just centre the caret in whatever remains.
+            bandTop = imeVisibleTop;
+            bandBottom = Math.max(imeVisibleTop + 1, imeVisibleBottom);
         }
+
+        // Caret edges in view-local coordinates.
+        float caretViewTop = caretDocTop - sy;
+        float caretViewBottom = caretDocBottom - sy;
+
+        if (caretViewTop < bandTop) {
+            sy = Math.round(caretDocTop - bandTop);
+        } else if (caretViewBottom > bandBottom) {
+            sy = Math.round(caretDocBottom - bandBottom);
+        }
+
         if (x < sx + gutterWidth) {
             sx = (int) Math.max(0, x - gutterWidth - charWidth * 4);
         } else if (x > sx + getWidth() - charWidth * 2) {
@@ -1022,6 +1129,26 @@ public class CodeEditorView extends View
         postDelayed(caretBlink, 500);
     }
 
+    /**
+     * Called from the global-layout listener when the window's visible frame
+     * may have changed (IME show / hide / resize). Scrolls the caret out from
+     * under a newly shown keyboard even if our own height did not change
+     * (adjustPan / edge-to-edge hosts).
+     */
+    private void onPossibleImeLayoutChange() {
+        if (!isFocused() || document == null) {
+            refreshImeVisibleBand();
+            return;
+        }
+        boolean bandChanged = refreshImeVisibleBand();
+        if (bandChanged) {
+            ensureCaretVisible();
+            if (completionPopup != null && completionPopup.isShowing()) {
+                requestCompletionsAtCaret();
+            }
+        }
+    }
+
     @Override
     protected void onFocusChanged(boolean gained, int direction,
                                   android.graphics.Rect prev) {
@@ -1029,6 +1156,9 @@ public class CodeEditorView extends View
         removeCallbacks(caretBlink);
         if (gained) {
             resetCaretBlink();
+            // Keyboard often appears right after focus — defer one frame so the
+            // visible display frame has settled, then reveal the caret.
+            post(this::ensureCaretVisible);
         } else {
             dismissCompletions();
         }
@@ -1038,12 +1168,16 @@ public class CodeEditorView extends View
     @Override
     protected void onSizeChanged(int w, int h, int oldw, int oldh) {
         super.onSizeChanged(w, h, oldw, oldh);
-        // IME show/hide resizes us via windowInsets / adjustablePan alternatives;
-        // re-clamp scroll and re-anchor the popup if it's up.
+        // adjustResize: our height shrinks when the IME opens. Recompute the
+        // visible band and bring the caret back above the keyboard.
+        refreshImeVisibleBand();
         int sx = Math.min(getScrollX(), maxScrollX());
         int sy = Math.min(getScrollY(), maxScrollY());
         if (sx != getScrollX() || sy != getScrollY()) {
             scrollTo(sx, sy);
+        }
+        if (isFocused()) {
+            ensureCaretVisible();
         }
         if (completionPopup != null && completionPopup.isShowing()) {
             // Re-query with the new visible frame so the popup climbs above
@@ -1053,7 +1187,15 @@ public class CodeEditorView extends View
     }
 
     @Override
+    protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        getViewTreeObserver().addOnGlobalLayoutListener(imeLayoutListener);
+        refreshImeVisibleBand();
+    }
+
+    @Override
     protected void onDetachedFromWindow() {
+        getViewTreeObserver().removeOnGlobalLayoutListener(imeLayoutListener);
         super.onDetachedFromWindow();
         removeCallbacks(caretBlink);
         if (completionPopup != null) completionPopup.dismiss();
