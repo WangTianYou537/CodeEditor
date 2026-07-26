@@ -34,6 +34,7 @@ import cn.wty5.editor.lang.TokenType;
 import cn.wty5.editor.plugin.PluginManager;
 
 import java.io.File;
+import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -99,6 +100,11 @@ public class CodeEditorView extends View
     private float baselineShift;
     private float gutterWidth;
     private float gutterPad;
+    /** Number of monospace cells between tab stops. */
+    private static final int TAB_SIZE = 4;
+    /** Reused per-line buffers: no allocations in the visible-line draw loop. */
+    private float[] columnXs = new float[128];
+    private float[] glyphWidths = new float[128];
     private float handleRadius;
 
     // -- scrolling / zoom ------------------------------------------------
@@ -115,9 +121,36 @@ public class CodeEditorView extends View
      * synthesise an {@code onSingleTapUp}.
      */
     private boolean suppressSingleFingerGestures;
-    /** Anchor document position kept under the fingers during a pinch. */
-    private float zoomFocusDocX;
-    private float zoomFocusDocY;
+    /**
+     * Semantic document coordinate under the pinch focus. Using line plus an
+     * x-coordinate expressed in current monospace-em units rather than old
+     * pixels is essential: when text metrics change, old pixels no longer
+     * identify the same code position and the viewport drifts (especially
+     * visible on long comment lines).
+     */
+    private float zoomAnchorXEm;
+    private float zoomAnchorLine;
+    private boolean zoomAnchorInGutter;
+    /** Horizontal scroll at pinch start; gutter pinches must preserve it. */
+    private int zoomStartScrollX;
+    /** Largest measured line width, in monospace em units. */
+    private float maxObservedLineWidthEm;
+    private int widestObservedLine = -1;
+    /** NaN means this line has not been measured yet. */
+    private float[] lineWidthEms = new float[0];
+    /** Keeps width indices aligned with Document edits, including external edits. */
+    private final Document.ContentListener widthCacheListener =
+            new Document.ContentListener() {
+                @Override
+                public void onInsert(Document doc, int offset, String text) {
+                    updateWidthsAfterInsert(doc, offset, text);
+                }
+
+                @Override
+                public void onDelete(Document doc, int offset, String text) {
+                    updateWidthsAfterDelete(doc, offset, text);
+                }
+            };
 
     /**
      * Cached visible band of this view that is NOT covered by the soft
@@ -187,6 +220,9 @@ public class CodeEditorView extends View
     // ------------------------------------------------------------------
 
     public void setDocument(Document doc) {
+        if (this.document != null) {
+            this.document.removeContentListener(widthCacheListener);
+        }
         if (highlighter != null) {
             highlighter.shutdown();
         }
@@ -197,6 +233,8 @@ public class CodeEditorView extends View
             completionPopup.dismiss();
         }
         this.document = doc;
+        this.document.addContentListener(widthCacheListener);
+        resetLineWidthCache(doc.lineCount());
         this.undoManager = new UndoManager(doc);
         Lexer lexer = Languages.lexerFor(language == null ? "java" : language.name);
         this.highlighter = new Highlighter(doc, lexer, this);
@@ -267,6 +305,7 @@ public class CodeEditorView extends View
         undoManager.clear();
         caret = 0;
         selectionAnchor = -1;
+        resetLineWidthCache(document.lineCount());
         highlighter.invalidateAll();
         updateGutterWidth();
         scrollTo(0, 0);
@@ -578,8 +617,7 @@ public class CodeEditorView extends View
     /** View-local (x, y) of the handle circle centre for a document offset. */
     private float[] handleViewPos(int offset, boolean startHandle) {
         int line = document.lineOfOffset(offset);
-        int col = offset - document.lineStart(line);
-        float x = gutterWidth + col * charWidth - getScrollX();
+        float x = contentXForOffset(offset) - getScrollX();
         float y = startHandle
                 ? line * lineHeight - getScrollY() - handleRadius * 0.55f
                 : (line + 1) * lineHeight - getScrollY() + handleRadius * 0.55f;
@@ -907,8 +945,7 @@ public class CodeEditorView extends View
         int[] loc = new int[2];
         getLocationInWindow(loc);
         int line = document.lineOfOffset(caret);
-        int col = caret - document.lineStart(line);
-        float caretDocX = gutterWidth + col * charWidth;
+        float caretDocX = contentXForOffset(caret);
         float caretDocTop = line * lineHeight;
         int caretX = loc[0] + Math.round(caretDocX) - getScrollX();
         int caretTop = loc[1] + Math.round(caretDocTop) - getScrollY();
@@ -998,6 +1035,8 @@ public class CodeEditorView extends View
             int lineStart = document.lineStart(line);
             String content = document.lineContent(line);
             int contentLen = content.length();
+            float[] xs = buildColumnXs(content, contentLen);
+            observeLineWidth(line, xs[contentLen]);
 
             // Current-line highlight.
             if (line == caretLine && selStart < 0) {
@@ -1012,8 +1051,11 @@ public class CodeEditorView extends View
                 int s = Math.max(selStart, lineStart);
                 int e = Math.min(selEnd, lineEnd + 1); // +1 covers the '\n'
                 if (s < e) {
-                    float x1 = gw + (s - lineStart) * cw;
-                    float x2 = gw + (e - lineStart) * cw;
+                    float x1 = gw + xs[s - lineStart];
+                    // e may include the newline; paint one cell beyond EOL.
+                    int endColumn = Math.min(contentLen, e - lineStart);
+                    float x2 = gw + xs[endColumn];
+                    if (e > lineEnd) x2 += cw;
                     fillPaint.setColor(scheme.selection);
                     canvas.drawRect(x1, top, x2, top + lh, fillPaint);
                 }
@@ -1027,15 +1069,18 @@ public class CodeEditorView extends View
             if (spans == null || spans.size() == 0 || contentLen == 0) {
                 if (contentLen > 0) {
                     textPaint.setColor(scheme.foreground);
-                    canvas.drawText(content, gw, baseline, textPaint);
+                    drawMeasuredRange(canvas, content, 0, contentLen,
+                            gw, baseline, xs);
                 }
             } else {
-                drawSpannedLine(canvas, content, contentLen, spans, gw, baseline, cw);
+                drawSpannedLine(canvas, content, contentLen, spans, gw, baseline, xs);
             }
 
             // Caret (hidden while a range is selected — handles show the ends).
             if (line == caretLine && caretVisible && isFocused() && selStart < 0) {
-                float cx = gw + (caret - lineStart) * cw;
+                int caretColumn = Math.max(0,
+                        Math.min(contentLen, caret - lineStart));
+                float cx = gw + xs[caretColumn];
                 fillPaint.setColor(scheme.caret);
                 // 2-device-px wide caret, pixel-aligned.
                 float caretW = Math.max(2f, density);
@@ -1061,12 +1106,19 @@ public class CodeEditorView extends View
         drawHandleAt(canvas, selectionEnd(), /*start*/ false);
     }
 
+    /**
+     * Draws one handle in the same content coordinate system as the text.
+     * {@link View#scrollTo(int, int)} already translates the Canvas before
+     * {@link #onDraw(Canvas)}; subtracting scroll here again would apply the
+     * offset twice. That bug becomes very visible after pinch zoom changes
+     * both metrics and scroll position. Hit testing stays view-local via
+     * {@link #handleViewPos(int, boolean)}.
+     */
     private void drawHandleAt(Canvas canvas, int offset, boolean startHandle) {
         if (document == null || lineHeight <= 0f) return;
         int line = document.lineOfOffset(offset);
-        int col = offset - document.lineStart(line);
-        float x = gutterWidth + col * charWidth - getScrollX();
-        float lineTop = line * lineHeight - getScrollY();
+        float x = contentXForOffset(offset);
+        float lineTop = line * lineHeight;
         float lineBottom = lineTop + lineHeight;
         float r = handleRadius;
 
@@ -1091,14 +1143,14 @@ public class CodeEditorView extends View
     }
 
     /**
-     * Paints one line from its span list. Spans whose columns fall past
-     * {@code contentLen} (stale after a delete) are clipped; gaps are filled
-     * with the default foreground so a partially-updated line never shows
-     * holes.
+     * Paints one line from its span list. X positions come from measured glyph
+     * advances rather than {@code column * charWidth}; after zoom, tabs,
+     * CJK/emoji and fallback glyphs otherwise make comment token boundaries
+     * drift away from both the text and touch coordinates.
      */
     private void drawSpannedLine(Canvas canvas, String content, int contentLen,
                                  LineSpans spans, float x0, float baseline,
-                                 float cw) {
+                                 float[] xs) {
         int drawn = 0;
         int n = spans.size();
         for (int i = 0; i < n; i++) {
@@ -1111,20 +1163,126 @@ public class CodeEditorView extends View
 
             if (drawn < s) {
                 textPaint.setColor(scheme.foreground);
-                canvas.drawText(content, drawn, s, x0 + drawn * cw, baseline, textPaint);
+                drawMeasuredRange(canvas, content, drawn, s,
+                        x0 + xs[drawn], baseline, xs);
             }
             TokenType t = spans.type(i);
-            if (t != TokenType.WHITESPACE) {
+            if (t == TokenType.WHITESPACE) {
+                // Spans intentionally remain cached while async re-lexing to
+                // avoid colour flashes. After a delete, however, an old
+                // whitespace range may now cover a real character. Never skip
+                // that character: draw it in foreground until fresh spans land.
+                if (!isCurrentWhitespace(content, s, e)) {
+                    textPaint.setColor(scheme.foreground);
+                    drawMeasuredRange(canvas, content, s, e,
+                            x0 + xs[s], baseline, xs);
+                }
+            } else {
                 textPaint.setColor(scheme.colorOf(t));
-                canvas.drawText(content, s, e, x0 + s * cw, baseline, textPaint);
+                drawMeasuredRange(canvas, content, s, e,
+                        x0 + xs[s], baseline, xs);
             }
             drawn = e;
         }
         if (drawn < contentLen) {
             textPaint.setColor(scheme.foreground);
-            canvas.drawText(content, drawn, contentLen,
-                    x0 + drawn * cw, baseline, textPaint);
+            drawMeasuredRange(canvas, content, drawn, contentLen,
+                    x0 + xs[drawn], baseline, xs);
         }
+    }
+
+    /** True when the current (possibly edited) text range is still whitespace. */
+    private static boolean isCurrentWhitespace(String text, int start, int end) {
+        for (int i = start; i < end; i++) {
+            char c = text.charAt(i);
+            if (c != ' ' && c != '\t') return false;
+        }
+        return true;
+    }
+
+    /**
+     * Draws a measured range, expanding tabs to the same stops used by
+     * hit-testing. Non-tab runs use Canvas's fast substring draw path.
+     */
+    private void drawMeasuredRange(Canvas canvas, String text, int start, int end,
+                                   float x, float baseline, float[] xs) {
+        int runStart = start;
+        for (int i = start; i < end; i++) {
+            if (text.charAt(i) != '\t') continue;
+            if (runStart < i) {
+                canvas.drawText(text, runStart, i,
+                        x + xs[runStart] - xs[start], baseline, textPaint);
+            }
+            // Tab is spacing only; next run begins at its measured tab stop.
+            runStart = i + 1;
+        }
+        if (runStart < end) {
+            canvas.drawText(text, runStart, end,
+                    x + xs[runStart] - xs[start], baseline, textPaint);
+        }
+    }
+
+    /**
+     * Returns cumulative x advances for UTF-16 columns [0..length]. The
+     * buffer is reused for every visible line to avoid per-frame garbage.
+     */
+    private float[] buildColumnXs(String text, int length) {
+        int needed = length + 1;
+        if (columnXs.length < needed) {
+            int cap = Math.max(needed, columnXs.length * 2);
+            columnXs = new float[cap];
+            glyphWidths = new float[cap];
+        }
+        columnXs[0] = 0f;
+        if (length == 0) return columnXs;
+
+        // Hot path for the overwhelmingly common source-code line: ASCII,
+        // no tabs. The configured monospace face gives every ASCII glyph the
+        // same advance, so avoid a native getTextWidths() call per frame.
+        boolean simpleMonospace = true;
+        for (int i = 0; i < length; i++) {
+            char c = text.charAt(i);
+            if (c == '\t' || c < 0x20 || c > 0x7E) {
+                simpleMonospace = false;
+                break;
+            }
+        }
+        if (simpleMonospace) {
+            for (int i = 1; i <= length; i++) {
+                columnXs[i] = i * charWidth;
+            }
+            return columnXs;
+        }
+
+        textPaint.getTextWidths(text, 0, length, glyphWidths);
+        float x = 0f;
+        float tabWidth = Math.max(1f, charWidth * TAB_SIZE);
+        for (int i = 0; i < length; i++) {
+            char c = text.charAt(i);
+            if (c == '\t') {
+                float stops = (float) Math.floor(x / tabWidth) + 1f;
+                x = stops * tabWidth;
+            } else {
+                float w = glyphWidths[i];
+                // Trailing UTF-16 surrogate units can report zero width;
+                // preserve the measured cumulative position rather than
+                // inventing a cell so token endpoints remain aligned.
+                x += Math.max(0f, w);
+            }
+            columnXs[i + 1] = x;
+        }
+        return columnXs;
+    }
+
+    /** X of one document offset in content coordinates. */
+    private float contentXForOffset(int offset) {
+        int line = document.lineOfOffset(offset);
+        int lineStart = document.lineStart(line);
+        String content = document.lineContent(line);
+        int column = Math.max(0, Math.min(content.length(), offset - lineStart));
+        float[] xs = buildColumnXs(content, content.length());
+        observeLineWidth(line, xs[content.length()]);
+        return gutterWidth + xs[column];
     }
 
     private void drawGutter(Canvas canvas, int scrollX, int scrollY, int viewH,
@@ -1189,6 +1347,7 @@ public class CodeEditorView extends View
                 scaling = false;
                 suppressSingleFingerGestures = false;
                 dispatchGestureCancel(event);
+                resetCaretBlink();
             }
             return true;
         }
@@ -1294,12 +1453,180 @@ public class CodeEditorView extends View
     }
 
     private int offsetForPoint(float viewX, float viewY) {
-        float docX = viewX + getScrollX() - gutterWidth;
+        // The gutter is pinned in view space. A touch inside it always maps to
+        // column zero, regardless of horizontal scroll underneath.
+        float docX = viewX <= gutterWidth
+                ? 0f
+                : viewX + getScrollX() - gutterWidth;
         float docY = viewY + getScrollY();
         int line = Math.max(0, Math.min((int) (docY / lineHeight),
                 document.lineCount() - 1));
-        int col = Math.max(0, Math.round(docX / charWidth));
-        return document.offsetAt(line, col);
+        String content = document.lineContent(line);
+        float[] xs = buildColumnXs(content, content.length());
+        float targetX = Math.max(0f, docX);
+
+        // Lower-bound search in measured glyph advances, then snap to the
+        // nearer caret edge. This uses exactly the same coordinates as token
+        // drawing, so zoomed comments/tabs/wide glyphs remain tappable.
+        int lo = 0;
+        int hi = content.length();
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (xs[mid] < targetX) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        int column = lo;
+        if (column > 0 && column <= content.length()) {
+            float leftDistance = targetX - xs[column - 1];
+            float rightDistance = xs[column] - targetX;
+            if (leftDistance <= rightDistance) column--;
+        }
+        column = snapColumnToCodePointBoundary(content, column);
+        observeLineWidth(line, xs[content.length()]);
+        return document.offsetAt(line, column);
+    }
+
+    /** Never return a UTF-16 offset between a high and low surrogate. */
+    private static int snapColumnToCodePointBoundary(String text, int column) {
+        if (column > 0 && column < text.length()
+                && Character.isHighSurrogate(text.charAt(column - 1))
+                && Character.isLowSurrogate(text.charAt(column))) {
+            // Use the nearer outside boundary; measured trailing surrogate
+            // positions are commonly equal, so prefer after the code point.
+            return column + 1;
+        }
+        return column;
+    }
+
+    /** Resets the line-width cache; unknown entries are measured lazily. */
+    private void resetLineWidthCache(int lineCount) {
+        lineWidthEms = new float[Math.max(1, lineCount)];
+        Arrays.fill(lineWidthEms, Float.NaN);
+        maxObservedLineWidthEm = 0f;
+        widestObservedLine = -1;
+    }
+
+    private void updateWidthsAfterInsert(Document doc, int offset, String text) {
+        int line = doc.lineOfOffset(offset);
+        int added = countNewlines(text);
+        resizeWidthCacheForInsert(line, added, doc.lineCount());
+        measureLineWidth(line);
+        for (int i = 1; i <= added && line + i < doc.lineCount(); i++) {
+            measureLineWidth(line + i);
+        }
+        recomputeMaxObservedWidth();
+        clampHorizontalScrollToContent();
+    }
+
+    private void updateWidthsAfterDelete(Document doc, int offset, String text) {
+        int line = doc.lineOfOffset(offset);
+        int removed = countNewlines(text);
+        resizeWidthCacheForDelete(line, removed, doc.lineCount());
+        measureLineWidth(line);
+        recomputeMaxObservedWidth();
+        clampHorizontalScrollToContent();
+    }
+
+    private static int countNewlines(String text) {
+        int count = 0;
+        for (int i = 0; i < text.length(); i++) {
+            if (text.charAt(i) == '\n') count++;
+        }
+        return count;
+    }
+
+    private void resizeWidthCacheForInsert(int line, int added, int lineCount) {
+        int target = Math.max(1, lineCount);
+        float[] next = new float[target];
+        Arrays.fill(next, Float.NaN);
+        int prefix = Math.min(line, Math.min(lineWidthEms.length, next.length));
+        if (prefix > 0) {
+            System.arraycopy(lineWidthEms, 0, next, 0, prefix);
+        }
+        int oldTailStart = Math.min(line + 1, lineWidthEms.length);
+        int newTailStart = Math.min(line + added + 1, next.length);
+        int tail = Math.min(lineWidthEms.length - oldTailStart,
+                next.length - newTailStart);
+        if (tail > 0) {
+            System.arraycopy(lineWidthEms, oldTailStart, next, newTailStart, tail);
+        }
+        lineWidthEms = next;
+    }
+
+    private void resizeWidthCacheForDelete(int line, int removed, int lineCount) {
+        int target = Math.max(1, lineCount);
+        float[] next = new float[target];
+        Arrays.fill(next, Float.NaN);
+        int prefix = Math.min(line, Math.min(lineWidthEms.length, next.length));
+        if (prefix > 0) {
+            System.arraycopy(lineWidthEms, 0, next, 0, prefix);
+        }
+        int oldTailStart = Math.min(line + removed + 1, lineWidthEms.length);
+        int newTailStart = Math.min(line + 1, next.length);
+        int tail = Math.min(lineWidthEms.length - oldTailStart,
+                next.length - newTailStart);
+        if (tail > 0) {
+            System.arraycopy(lineWidthEms, oldTailStart, next, newTailStart, tail);
+        }
+        lineWidthEms = next;
+    }
+
+    private void measureLineWidth(int line) {
+        if (document == null || charWidth <= 0f
+                || line < 0 || line >= document.lineCount()) {
+            return;
+        }
+        String content = document.lineContent(line);
+        float[] xs = buildColumnXs(content, content.length());
+        if (line >= lineWidthEms.length) {
+            lineWidthEms = Arrays.copyOf(lineWidthEms, line + 1);
+        }
+        lineWidthEms[line] = xs[content.length()] / charWidth;
+    }
+
+    /** Records one measured line and maintains the maximum. */
+    private void observeLineWidth(int line, float widthPx) {
+        if (charWidth <= 0f || line < 0) return;
+        if (line >= lineWidthEms.length) {
+            int oldLength = lineWidthEms.length;
+            lineWidthEms = Arrays.copyOf(lineWidthEms,
+                    Math.max(line + 1, Math.max(1, oldLength * 2)));
+            Arrays.fill(lineWidthEms, oldLength, lineWidthEms.length, Float.NaN);
+        }
+        float em = widthPx / charWidth;
+        float old = lineWidthEms[line];
+        lineWidthEms[line] = em;
+        if (em >= maxObservedLineWidthEm) {
+            maxObservedLineWidthEm = em;
+            widestObservedLine = line;
+        } else if (line == widestObservedLine && !Float.isNaN(old) && em < old) {
+            recomputeMaxObservedWidth();
+            clampHorizontalScrollToContent();
+        }
+    }
+
+    private void recomputeMaxObservedWidth() {
+        maxObservedLineWidthEm = 0f;
+        widestObservedLine = -1;
+        int count = document == null ? 0 : document.lineCount();
+        for (int line = 0; line < count && line < lineWidthEms.length; line++) {
+            float em = lineWidthEms[line];
+            if (!Float.isNaN(em) && em > maxObservedLineWidthEm) {
+                maxObservedLineWidthEm = em;
+                widestObservedLine = line;
+            }
+        }
+    }
+
+    private void clampHorizontalScrollToContent() {
+        int max = maxScrollX();
+        if (getScrollX() > max) {
+            scroller.forceFinished(true);
+            scrollTo(max, getScrollY());
+        }
     }
 
     private int maxScrollY() {
@@ -1311,7 +1638,12 @@ public class CodeEditorView extends View
     }
 
     private int maxScrollX() {
-        return (int) Math.max(0, 200 * charWidth);
+        // Use the widest line observed by drawing/hit-testing. Add a small
+        // right margin so the final glyph and caret are not flush to the edge.
+        float contentWidth = maxObservedLineWidthEm * charWidth;
+        float rightPadding = Math.max(charWidth * 4f, 16f * density);
+        return (int) Math.max(0f,
+                gutterWidth + contentWidth + rightPadding - getWidth());
     }
 
     /**
@@ -1392,10 +1724,9 @@ public class CodeEditorView extends View
         refreshImeVisibleBand();
 
         int line = document.lineOfOffset(caret);
-        int col = caret - document.lineStart(line);
         float caretDocTop = line * lineHeight;
         float caretDocBottom = caretDocTop + lineHeight;
-        float x = gutterWidth + col * charWidth;
+        float x = contentXForOffset(caret);
 
         int sx = getScrollX();
         int sy = getScrollY();
@@ -1500,6 +1831,10 @@ public class CodeEditorView extends View
     @Override
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
+        if (document != null) {
+            document.removeContentListener(widthCacheListener);
+            document.addContentListener(widthCacheListener);
+        }
         getViewTreeObserver().addOnGlobalLayoutListener(imeLayoutListener);
         refreshImeVisibleBand();
     }
@@ -1507,6 +1842,7 @@ public class CodeEditorView extends View
     @Override
     protected void onDetachedFromWindow() {
         getViewTreeObserver().removeOnGlobalLayoutListener(imeLayoutListener);
+        if (document != null) document.removeContentListener(widthCacheListener);
         super.onDetachedFromWindow();
         removeCallbacks(caretBlink);
         if (completionPopup != null) completionPopup.dismiss();
@@ -1528,9 +1864,20 @@ public class CodeEditorView extends View
             scaling = true;
             scroller.forceFinished(true);
             dismissCompletions();
-            // Document point currently under the pinch focus.
-            zoomFocusDocX = getScrollX() + detector.getFocusX();
-            zoomFocusDocY = getScrollY() + detector.getFocusY();
+
+            // The gutter is pinned in view space, while text scrolls beneath
+            // it. Therefore gutter detection must use the view-local focus X.
+            float focusViewX = detector.getFocusX();
+            float focusDocX = getScrollX() + focusViewX;
+            float focusDocY = getScrollY() + detector.getFocusY();
+            zoomStartScrollX = getScrollX();
+            zoomAnchorInGutter = focusViewX < gutterWidth;
+            zoomAnchorXEm = zoomAnchorInGutter
+                    ? 0f
+                    : Math.max(0f,
+                            (focusDocX - gutterWidth) / Math.max(1f, charWidth));
+            zoomAnchorLine = Math.max(0f,
+                    focusDocY / Math.max(1f, lineHeight));
             return true;
         }
 
@@ -1549,24 +1896,20 @@ public class CodeEditorView extends View
                 return true;
             }
 
-            // Recompute metrics, then keep the original document point locked
-            // under the (possibly moving) focus fingers.
-            textSizeSp = newSp;
-            float px = textSizeSp * density;
-            textPaint.setTextSize(px);
-            gutterPaint.setTextSize(px * 0.85f);
-            Paint.FontMetrics fm = textPaint.getFontMetrics();
-            lineHeight = (float) Math.ceil(fm.descent - fm.ascent + fm.leading);
-            if (lineHeight < 1f) lineHeight = 1f;
-            baselineShift = -fm.ascent;
-            charWidth = textPaint.measureText("M");
-            gutterPad = charWidth * 0.75f;
-            updateGutterWidth();
+            updateTextMetricsForScale(newSp);
 
-            float focusX = detector.getFocusX();
-            float focusY = detector.getFocusY();
-            int nx = Math.round(zoomFocusDocX - focusX);
-            int ny = Math.round(zoomFocusDocY - focusY);
+            // Rebuild the semantic anchor with the NEW metrics, then scroll it
+            // back under the (possibly moving) pinch midpoint. A gutter pinch
+            // changes only scale/vertical position; preserve horizontal scroll.
+            float anchorDocY = zoomAnchorLine * lineHeight;
+            int nx;
+            if (zoomAnchorInGutter) {
+                nx = zoomStartScrollX;
+            } else {
+                float anchorDocX = gutterWidth + zoomAnchorXEm * charWidth;
+                nx = Math.round(anchorDocX - detector.getFocusX());
+            }
+            int ny = Math.round(anchorDocY - detector.getFocusY());
             nx = Math.max(0, Math.min(nx, maxScrollX()));
             ny = Math.max(0, Math.min(ny, maxScrollY()));
             scrollTo(nx, ny);
@@ -1585,6 +1928,21 @@ public class CodeEditorView extends View
             scrollTo(nx, ny);
             invalidate();
         }
+    }
+
+    /** Recomputes zoom-dependent metrics without changing caret/selection. */
+    private void updateTextMetricsForScale(float newSp) {
+        textSizeSp = newSp;
+        float px = textSizeSp * density;
+        textPaint.setTextSize(px);
+        gutterPaint.setTextSize(px * 0.85f);
+        Paint.FontMetrics fm = textPaint.getFontMetrics();
+        lineHeight = (float) Math.ceil(fm.descent - fm.ascent + fm.leading);
+        if (lineHeight < 1f) lineHeight = 1f;
+        baselineShift = -fm.ascent;
+        charWidth = textPaint.measureText("M");
+        gutterPad = charWidth * 0.75f;
+        updateGutterWidth();
     }
 
     private final class GestureListener extends GestureDetector.SimpleOnGestureListener
