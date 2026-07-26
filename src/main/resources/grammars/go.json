@@ -1,0 +1,70 @@
+{
+  "name": "go",
+  "extensions": ["go"],
+  "keywords": [
+    "break", "case", "chan", "const", "continue", "default", "defer",
+    "else", "fallthrough", "for", "func", "go", "goto", "if", "import",
+    "interface", "map", "package", "range", "return", "select", "struct",
+    "switch", "type", "var", "true", "false", "iota", "nil"
+  ],
+  "types": [
+    "bool", "byte", "complex64", "complex128", "error", "float32",
+    "float64", "int", "int8", "int16", "int32", "int64", "rune",
+    "string", "uint", "uint8", "uint16", "uint32", "uint64", "uintptr",
+    "any", "comparable"
+  ],
+  "snippets": [
+    {
+      "trigger": "main",
+      "insert": "func main() {\n\t$0\n}",
+      "detail": "main function"
+    },
+    {
+      "trigger": "func",
+      "insert": "func $0() {\n}",
+      "detail": "function"
+    },
+    {
+      "trigger": "fori",
+      "insert": "for i := 0; i < $0; i++ {\n}",
+      "detail": "C-style for"
+    },
+    {
+      "trigger": "forr",
+      "insert": "for _, v := range $0 {\n}",
+      "detail": "range loop"
+    },
+    {
+      "trigger": "iferr",
+      "insert": "if err != nil {\n\treturn $0\n}",
+      "detail": "if err != nil"
+    },
+    {
+      "trigger": "pf",
+      "insert": "fmt.Printf(\"$0\\n\")",
+      "detail": "fmt.Printf"
+    },
+    {
+      "trigger": "pl",
+      "insert": "fmt.Println($0)",
+      "detail": "fmt.Println"
+    },
+    {
+      "trigger": "struct",
+      "insert": "type $0 struct {\n}",
+      "detail": "struct type"
+    }
+  ],
+  "lineComment": "//",
+  "blockComment": ["/*", "*/"],
+  "rawStringDelimiter": "`",
+  "doubleQuotedStrings": true,
+  "singleQuotedChars": true,
+  "singleQuotedStrings": false,
+  "operatorChars": "+-*/%=<>!&|^~:",
+  "punctuationChars": "(){}[];,.",
+  "hexNumbers": true,
+  "binNumbers": true,
+  "underscoreInNumbers": true,
+  "numberSuffixes": ""
+}

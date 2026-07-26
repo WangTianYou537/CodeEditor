@@ -379,7 +379,7 @@ public class CoreTest {
                 + "    void getThreadBinding() {}\n"
                 + "}\n"
                 + "cou");
-        CompletionProvider provider = new CompletionProvider(doc);
+        CompletionProvider provider = new CompletionProvider(doc, com.editor.lang.Languages.java());
         int caret = doc.length(); // right after "cou"
         String snap = doc.toString();
         long ver = doc.version();

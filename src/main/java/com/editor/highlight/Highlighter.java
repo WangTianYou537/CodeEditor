@@ -5,7 +5,7 @@ import android.os.HandlerThread;
 import android.os.Looper;
 
 import com.editor.core.Document;
-import com.editor.lang.JavaLexer;
+import com.editor.lang.Lexer;
 import com.editor.lang.TokenType;
 
 import java.util.ArrayList;
@@ -21,6 +21,9 @@ import java.util.List;
  * UI thread; stale results (document changed meanwhile) are dropped by
  * version check and the edit is re-processed.
  *
+ * The {@link Lexer} is pluggable — swap it (via {@link #setLexer}) when the
+ * user changes language; that invalidates the whole span cache.
+ *
  * Threading: all public methods must be called from the UI thread.
  */
 public final class Highlighter implements Document.ContentListener {
@@ -31,7 +34,7 @@ public final class Highlighter implements Document.ContentListener {
     }
 
     private final Document document;
-    private final JavaLexer lexer = new JavaLexer();
+    private volatile Lexer lexer;
     private final Callback callback;
 
     private final List<LineSpans> lines = new ArrayList<>();
@@ -52,14 +55,25 @@ public final class Highlighter implements Document.ContentListener {
      */
     private static final int CHUNK_LINES = 256;
 
-    public Highlighter(Document document, Callback callback) {
+    public Highlighter(Document document, Lexer lexer, Callback callback) {
         this.document = document;
+        this.lexer = lexer;
         this.callback = callback;
         this.workerThread = new HandlerThread("editor-highlight");
         this.workerThread.start();
         this.worker = new Handler(workerThread.getLooper());
         document.addContentListener(this);
         invalidateAll();
+    }
+
+    /** Swaps the lexer (e.g. on language change) and re-highlights everything. */
+    public void setLexer(Lexer lexer) {
+        this.lexer = lexer;
+        invalidateAll();
+    }
+
+    public Lexer getLexer() {
+        return lexer;
     }
 
     public void shutdown() {
@@ -77,7 +91,9 @@ public final class Highlighter implements Document.ContentListener {
         for (int i = 0, n = document.lineCount(); i < n; i++) {
             lines.add(null);
         }
-        markDirty(0, document.lineCount() - 1);
+        if (document.lineCount() > 0) {
+            markDirty(0, document.lineCount() - 1);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -158,31 +174,33 @@ public final class Highlighter implements Document.ContentListener {
 
         // Snapshot inputs on the UI thread; the worker only touches copies.
         final long version = document.version();
+        final Lexer currentLexer = this.lexer;
         final LineSpans prev = first > 0 && first - 1 < lines.size()
                 ? lines.get(first - 1) : null;
-        final int inState = prev != null ? prev.outState : JavaLexer.STATE_DEFAULT;
+        final int inState = prev != null ? prev.outState : Lexer.STATE_DEFAULT;
         final List<String> text = new ArrayList<>(last - first + 1);
         for (int i = first; i <= last; i++) {
             text.add(document.lineContent(i));
         }
 
-        worker.post(() -> lexRegion(version, first, inState, text));
+        worker.post(() -> lexRegion(version, first, inState, text, currentLexer));
     }
 
     /** Runs on the worker thread; only local data + immutable snapshots. */
-    private void lexRegion(long version, int firstLine, int inState, List<String> text) {
+    private void lexRegion(long version, int firstLine, int inState,
+                           List<String> text, Lexer lex) {
         List<LineSpans> fresh = new ArrayList<>(text.size());
         int state = inState;
         for (String line : text) {
-            state = lexOne(line, state, fresh);
+            state = lexOne(lex, line, state, fresh);
         }
         final int to = firstLine + fresh.size() - 1;
         main.post(() -> publish(version, firstLine, to, fresh));
     }
 
-    private int lexOne(String line, int inState, List<LineSpans> out) {
+    private int lexOne(Lexer lex, String line, int inState, List<LineSpans> out) {
         LineSpans spans = new LineSpans();
-        int outState = lexer.tokenizeLine(line, inState,
+        int outState = lex.tokenizeLine(line, inState,
                 (TokenType type, int s, int e) -> spans.add(type, s, e));
         spans.outState = outState;
         out.add(spans);

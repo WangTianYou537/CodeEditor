@@ -1,9 +1,9 @@
 package com.editor.complete;
 
 import com.editor.core.Document;
+import com.editor.lang.LanguageSpec;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -11,50 +11,36 @@ import java.util.Map;
 import java.util.TreeSet;
 
 /**
- * Completion sources: Java keywords, common snippets, and identifiers
- * harvested from the document itself.
+ * Completion sources driven by a {@link LanguageSpec}: keywords, types,
+ * snippets from the grammar, plus identifiers harvested from the document.
  *
  * The identifier index is a word → count map rebuilt lazily (at most once
- * per document version) by a full scan; scanning is a simple linear pass
- * over the piece table's CharSequence view, cheap enough for editor-sized
- * files and always run on the completion thread, never the UI thread.
+ * per document version) from a text snapshot taken on the UI thread.
  *
  * Ranking: prefix matches first (shorter word wins), then camel-hump /
- * substring matches; keywords slightly below identifiers that match exactly
- * by prefix, snippets on top when the prefix matches their trigger.
+ * substring matches; snippets rank highest when their trigger matches.
  */
 public final class CompletionProvider {
 
-    private static final String[] KEYWORDS = {
-            "abstract", "assert", "break", "case", "catch", "class", "continue",
-            "default", "do", "else", "enum", "extends", "final", "finally",
-            "for", "if", "implements", "import", "instanceof", "interface",
-            "native", "new", "package", "private", "protected", "public",
-            "return", "static", "strictfp", "super", "switch", "synchronized",
-            "this", "throw", "throws", "transient", "try", "void", "volatile",
-            "while", "record", "sealed", "yield", "var",
-            "boolean", "byte", "char", "double", "float", "int", "long",
-            "short", "true", "false", "null", "String", "Object", "Integer",
-            "List", "Map", "Set", "ArrayList", "HashMap", "HashSet",
-            "StringBuilder", "System", "Math", "Exception", "Thread",
-    };
-
-    private static final String[][] SNIPPETS = {
-            {"sout", "System.out.println($0);", "System.out.println"},
-            {"fori", "for (int i = 0; i < $0; i++) {\n}", "for loop"},
-            {"main", "public static void main(String[] args) {\n    $0\n}", "main method"},
-            {"psvm", "public static void main(String[] args) {\n    $0\n}", "main method"},
-            {"trycatch", "try {\n    $0\n} catch (Exception e) {\n}", "try/catch"},
-            {"ifn", "if ($0 == null) {\n}", "if null"},
-    };
-
     private final Document document;
+    private volatile LanguageSpec language;
     private final Map<String, Integer> wordIndex = new HashMap<>();
     /** Written on the worker thread, read on the UI thread (staleness check). */
     private volatile long indexedVersion = -1;
 
-    public CompletionProvider(Document document) {
+    public CompletionProvider(Document document, LanguageSpec language) {
         this.document = document;
+        this.language = language;
+    }
+
+    /** Swap language (e.g. after setLanguage); forces a re-index next time. */
+    public void setLanguage(LanguageSpec language) {
+        this.language = language;
+        indexedVersion = -1;
+    }
+
+    public LanguageSpec getLanguage() {
+        return language;
     }
 
     /** UI thread: does the engine need to snapshot the text for us? */
@@ -64,14 +50,11 @@ public final class CompletionProvider {
 
     /**
      * Computes suggestions for the given prefix. Called on the completion
-     * worker thread. {@code caretOffset} lets the scanner skip the word
-     * currently being typed so it doesn't suggest itself.
+     * worker thread.
      *
      * @param textSnapshot full document text captured on the UI thread, or
      *                     null when {@link #isIndexCurrent} reported the
-     *                     cached word index is still valid. The worker never
-     *                     reads the live document — the piece table is not
-     *                     thread-safe.
+     *                     cached word index is still valid.
      * @param version      document version the snapshot was taken at
      */
     public List<CompletionItem> complete(String prefix, int caretOffset,
@@ -81,33 +64,42 @@ public final class CompletionProvider {
         }
         rebuildIndexIfStale(textSnapshot, version, caretOffset, prefix.length());
 
+        LanguageSpec lang = this.language;
         List<Scored> scored = new ArrayList<>();
         String lowerPrefix = prefix.toLowerCase();
 
-        for (String[] snip : SNIPPETS) {
-            if (snip[0].startsWith(lowerPrefix) && !snip[0].equals(prefix)) {
-                scored.add(new Scored(1000 - snip[0].length(),
-                        new CompletionItem(CompletionItem.Kind.SNIPPET,
-                                snip[0], snip[1], snip[2])));
+        if (lang != null) {
+            for (LanguageSpec.Snippet snip : lang.snippets) {
+                if (snip.trigger.startsWith(lowerPrefix)
+                        && !snip.trigger.equals(prefix)) {
+                    scored.add(new Scored(1000 - snip.trigger.length(),
+                            new CompletionItem(CompletionItem.Kind.SNIPPET,
+                                    snip.trigger, snip.insert, snip.detail)));
+                }
+            }
+            for (String kw : lang.keywords) {
+                if (kw.startsWith(prefix) && !kw.equals(prefix)) {
+                    scored.add(new Scored(400 - kw.length(),
+                            new CompletionItem(CompletionItem.Kind.KEYWORD,
+                                    kw, kw, "keyword")));
+                }
+            }
+            for (String ty : lang.types) {
+                if (ty.startsWith(prefix) && !ty.equals(prefix)) {
+                    scored.add(new Scored(420 - ty.length(),
+                            new CompletionItem(CompletionItem.Kind.TYPE,
+                                    ty, ty, "type")));
+                }
             }
         }
+
         for (Map.Entry<String, Integer> e : wordIndex.entrySet()) {
             String word = e.getKey();
             int score = match(word, prefix, lowerPrefix);
             if (score > 0 && !word.equals(prefix)) {
-                // Frequent words rank higher; length breaks ties.
                 scored.add(new Scored(score + Math.min(e.getValue(), 50) - word.length(),
                         new CompletionItem(CompletionItem.Kind.IDENTIFIER,
                                 word, word, "in file")));
-            }
-        }
-        for (String kw : KEYWORDS) {
-            if (kw.startsWith(prefix) && !kw.equals(prefix)) {
-                boolean type = Character.isUpperCase(kw.charAt(0));
-                scored.add(new Scored(400 - kw.length(),
-                        new CompletionItem(
-                                type ? CompletionItem.Kind.TYPE : CompletionItem.Kind.KEYWORD,
-                                kw, kw, type ? "type" : "keyword")));
             }
         }
 
@@ -210,10 +202,5 @@ public final class CompletionProvider {
             this.score = score;
             this.item = item;
         }
-    }
-
-    // Exposed for tests.
-    static List<String> keywordList() {
-        return Arrays.asList(KEYWORDS);
     }
 }

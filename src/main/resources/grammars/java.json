@@ -1,0 +1,67 @@
+{
+  "name": "java",
+  "extensions": ["java"],
+  "keywords": [
+    "abstract", "assert", "break", "case", "catch", "class", "const",
+    "continue", "default", "do", "else", "enum", "extends", "final",
+    "finally", "for", "goto", "if", "implements", "import",
+    "instanceof", "interface", "native", "new", "package", "private",
+    "protected", "public", "return", "static", "strictfp", "super",
+    "switch", "synchronized", "this", "throw", "throws", "transient",
+    "try", "volatile", "while", "record", "sealed", "permits",
+    "yield", "var", "true", "false", "null"
+  ],
+  "types": [
+    "boolean", "byte", "char", "double", "float", "int", "long",
+    "short", "void",
+    "String", "Object", "Integer", "Long", "Double", "Float",
+    "Boolean", "Byte", "Short", "Character", "Void", "Number",
+    "CharSequence", "StringBuilder", "List", "Map", "Set",
+    "ArrayList", "HashMap", "HashSet", "Exception", "RuntimeException",
+    "Thread", "Runnable", "Math", "System"
+  ],
+  "snippets": [
+    {
+      "trigger": "sout",
+      "insert": "System.out.println($0);",
+      "detail": "System.out.println"
+    },
+    {
+      "trigger": "fori",
+      "insert": "for (int i = 0; i < $0; i++) {\n}",
+      "detail": "for loop"
+    },
+    {
+      "trigger": "main",
+      "insert": "public static void main(String[] args) {\n    $0\n}",
+      "detail": "main method"
+    },
+    {
+      "trigger": "psvm",
+      "insert": "public static void main(String[] args) {\n    $0\n}",
+      "detail": "main method"
+    },
+    {
+      "trigger": "trycatch",
+      "insert": "try {\n    $0\n} catch (Exception e) {\n}",
+      "detail": "try/catch"
+    },
+    {
+      "trigger": "ifn",
+      "insert": "if ($0 == null) {\n}",
+      "detail": "if null"
+    }
+  ],
+  "lineComment": "//",
+  "blockComment": ["/*", "*/"],
+  "textBlock": ["\"\"\"", "\"\"\""],
+  "doubleQuotedStrings": true,
+  "singleQuotedChars": true,
+  "singleQuotedStrings": false,
+  "operatorChars": "+-*/%=<>!&|^~?:",
+  "punctuationChars": "(){}[];,.",
+  "hexNumbers": true,
+  "binNumbers": true,
+  "underscoreInNumbers": true,
+  "numberSuffixes": "lLfFdD"
+}

@@ -5,6 +5,7 @@ import android.os.HandlerThread;
 import android.os.Looper;
 
 import com.editor.core.Document;
+import com.editor.lang.LanguageSpec;
 
 import java.util.List;
 
@@ -15,7 +16,7 @@ import java.util.List;
  * the engine extracts the identifier prefix before the caret, debounces,
  * computes suggestions on a worker thread, and delivers them on the UI
  * thread — dropping results that are stale by document version or caret
- * position.
+ * position. Keywords / snippets come from the active {@link LanguageSpec}.
  */
 public final class CompletionEngine {
 
@@ -36,13 +37,17 @@ public final class CompletionEngine {
 
     private long requestSeq;
 
-    public CompletionEngine(Document document, Callback callback) {
+    public CompletionEngine(Document document, LanguageSpec language, Callback callback) {
         this.document = document;
-        this.provider = new CompletionProvider(document);
+        this.provider = new CompletionProvider(document, language);
         this.callback = callback;
         this.workerThread = new HandlerThread("editor-completion");
         this.workerThread.start();
         this.worker = new Handler(workerThread.getLooper());
+    }
+
+    public void setLanguage(LanguageSpec language) {
+        provider.setLanguage(language);
     }
 
     public void shutdown() {

@@ -21,8 +21,14 @@ import com.editor.core.UndoManager;
 import com.editor.highlight.ColorScheme;
 import com.editor.highlight.Highlighter;
 import com.editor.highlight.LineSpans;
+import com.editor.lang.LanguageRegistry;
+import com.editor.lang.LanguageSpec;
+import com.editor.lang.Languages;
+import com.editor.lang.Lexer;
 import com.editor.lang.TokenType;
+import com.editor.plugin.PluginManager;
 
+import java.io.File;
 import java.util.List;
 
 /**
@@ -45,6 +51,8 @@ public class CodeEditorView extends View
     private CompletionEngine completionEngine;
     private CompletionPopup completionPopup;
     private final ColorScheme scheme = new ColorScheme();
+    private LanguageSpec language;
+    private final PluginManager pluginManager = new PluginManager();
 
     // -- caret & selection (offsets into the document) -------------------
     private int caret;
@@ -100,6 +108,8 @@ public class CodeEditorView extends View
         scroller = new OverScroller(context);
         gestureDetector = new GestureDetector(context, new GestureListener());
 
+        Languages.ensureBuiltins();
+        this.language = Languages.java();
         setDocument(new Document());
     }
 
@@ -116,14 +126,68 @@ public class CodeEditorView extends View
         }
         this.document = doc;
         this.undoManager = new UndoManager(doc);
-        this.highlighter = new Highlighter(doc, this);
-        this.completionEngine = new CompletionEngine(doc, this);
+        Lexer lexer = Languages.lexerFor(language == null ? "java" : language.name);
+        this.highlighter = new Highlighter(doc, lexer, this);
+        this.completionEngine = new CompletionEngine(doc, language, this);
         this.completionPopup = new CompletionPopup(this, scheme);
         this.completionPopup.setListener(this::applyCompletion);
         this.caret = 0;
         this.selectionAnchor = -1;
         updateGutterWidth();
         invalidate();
+    }
+
+    /**
+     * Switches syntax highlighting and completion to the named language
+     * (e.g. {@code "java"}, {@code "go"}). Unknown names fall back to a
+     * plain-text lexer with no keywords.
+     */
+    public void setLanguage(String name) {
+        Languages.ensureBuiltins();
+        LanguageSpec spec = LanguageRegistry.getInstance().getSpec(name);
+        if (spec == null) {
+            spec = new LanguageSpec.Builder().name(name == null ? "plain" : name).build();
+        }
+        setLanguage(spec);
+    }
+
+    /** Switches language from a file extension (without or with leading dot). */
+    public void setLanguageByExtension(String extension) {
+        Languages.ensureBuiltins();
+        LanguageSpec spec = LanguageRegistry.getInstance().getSpecByExtension(extension);
+        if (spec == null) {
+            spec = new LanguageSpec.Builder().name("plain").build();
+        }
+        setLanguage(spec);
+    }
+
+    public void setLanguage(LanguageSpec spec) {
+        this.language = spec;
+        if (highlighter != null) {
+            highlighter.setLexer(Languages.lexerFor(spec.name));
+        }
+        if (completionEngine != null) {
+            completionEngine.setLanguage(spec);
+        }
+        dismissCompletions();
+        invalidate();
+    }
+
+    public LanguageSpec getLanguage() {
+        return language;
+    }
+
+    public PluginManager getPluginManager() {
+        return pluginManager;
+    }
+
+    /**
+     * Loads every {@code *.json} grammar in {@code dir} into the shared
+     * registry. Already-open editors pick up a newly loaded language the
+     * next time {@link #setLanguage(String)} is called.
+     */
+    public List<String> loadGrammars(File dir) {
+        return Languages.loadFromDirectory(dir);
     }
 
     public void setText(String text) {
