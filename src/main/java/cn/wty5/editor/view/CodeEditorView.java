@@ -86,7 +86,16 @@ public class CodeEditorView extends View
     private final OverScroller scroller;
     private final GestureDetector gestureDetector;
     private final ScaleGestureDetector scaleDetector;
+    /** True while a pinch is actively changing the scale factor. */
     private boolean scaling;
+    /**
+     * True from the moment a 2nd pointer lands (or a scale begins) until
+     * every finger has lifted. Blocks caret moves / taps / scrolls that
+     * would otherwise fire from the leftover single-finger UP that ends a
+     * pinch — GestureDetector still remembers the original DOWN and would
+     * synthesise an {@code onSingleTapUp}.
+     */
+    private boolean suppressSingleFingerGestures;
     /** Anchor document position kept under the fingers during a pinch. */
     private float zoomFocusDocX;
     private float zoomFocusDocY;
@@ -948,17 +957,36 @@ public class CodeEditorView extends View
         // as a scroll by the gesture detector.
         scaleDetector.onTouchEvent(event);
 
-        int action = event.getActionMasked();
-        if (action == MotionEvent.ACTION_POINTER_DOWN && event.getPointerCount() >= 2) {
-            scaling = true;
-            scroller.forceFinished(true);
-            dismissCompletions();
+        final int action = event.getActionMasked();
+        final int pointerCount = event.getPointerCount();
+
+        // Second (or later) finger down → this touch sequence is a multi-touch
+        // session. Freeze scrolling, drop completions, and CANCEL the single-
+        // finger GestureDetector so its pending DOWN cannot become a tap when
+        // the last finger finally lifts.
+        if (action == MotionEvent.ACTION_POINTER_DOWN && pointerCount >= 2) {
+            beginMultiTouchSession(event);
         }
+
+        // All fingers up — end the session. Do NOT forward this UP to the
+        // GestureDetector if we were multi-touching: that is exactly what
+        // used to relocate the caret after a pinch-zoom.
         if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            boolean blocked = suppressSingleFingerGestures || scaling
+                    || scaleDetector.isInProgress();
             scaling = false;
+            suppressSingleFingerGestures = false;
+            if (blocked) {
+                // Deliver CANCEL (not UP) so GestureDetector resets cleanly
+                // without firing onSingleTapUp / onScroll.
+                dispatchGestureCancel(event);
+                return true;
+            }
         }
-        // While pinching, swallow one-finger gestures entirely.
-        if (scaling || event.getPointerCount() > 1) {
+
+        // Mid-pinch / multi-touch: swallow everything single-finger would use.
+        if (suppressSingleFingerGestures || scaling
+                || pointerCount > 1 || scaleDetector.isInProgress()) {
             return true;
         }
 
@@ -967,6 +995,26 @@ public class CodeEditorView extends View
             performClick();
         }
         return true;
+    }
+
+    /** Marks the current touch sequence as multi-touch and cancels taps. */
+    private void beginMultiTouchSession(MotionEvent event) {
+        suppressSingleFingerGestures = true;
+        scaling = true;
+        scroller.forceFinished(true);
+        dismissCompletions();
+        dispatchGestureCancel(event);
+    }
+
+    /** Feeds ACTION_CANCEL into GestureDetector without mutating {@code event}. */
+    private void dispatchGestureCancel(MotionEvent event) {
+        MotionEvent cancel = MotionEvent.obtain(event);
+        try {
+            cancel.setAction(MotionEvent.ACTION_CANCEL);
+            gestureDetector.onTouchEvent(cancel);
+        } finally {
+            cancel.recycle();
+        }
     }
 
     @Override
@@ -1211,6 +1259,9 @@ public class CodeEditorView extends View
 
         @Override
         public boolean onScaleBegin(ScaleGestureDetector detector) {
+            // May fire slightly after POINTER_DOWN; make sure the session flag
+            // is set even if the platform coalesced the pointer event.
+            suppressSingleFingerGestures = true;
             scaling = true;
             scroller.forceFinished(true);
             dismissCompletions();
@@ -1262,6 +1313,8 @@ public class CodeEditorView extends View
 
         @Override
         public void onScaleEnd(ScaleGestureDetector detector) {
+            // Keep suppressSingleFingerGestures set — the final finger is still
+            // down and its eventual UP must not become a caret-moving tap.
             scaling = false;
             // Snap scroll to legal range once more after the last factor.
             int nx = Math.max(0, Math.min(getScrollX(), maxScrollX()));
@@ -1275,12 +1328,18 @@ public class CodeEditorView extends View
 
         @Override
         public boolean onDown(MotionEvent e) {
+            // A fresh single-finger DOWN always starts a clean sequence.
+            // (Multi-touch sessions never reach here — they cancel first.)
             scroller.forceFinished(true);
             return true;
         }
 
         @Override
         public boolean onSingleTapUp(MotionEvent e) {
+            // Defensive: never relocate the caret if a pinch just ended.
+            if (suppressSingleFingerGestures || scaling) {
+                return true;
+            }
             requestFocus();
             moveCaretTo(offsetForPoint(e.getX(), e.getY()), false);
             dismissCompletions();
@@ -1294,19 +1353,25 @@ public class CodeEditorView extends View
 
         @Override
         public boolean onDoubleTap(MotionEvent e) {
+            if (suppressSingleFingerGestures || scaling) {
+                return true;
+            }
             selectWordAt(offsetForPoint(e.getX(), e.getY()));
             return true;
         }
 
         @Override
         public void onLongPress(MotionEvent e) {
+            if (suppressSingleFingerGestures || scaling) {
+                return;
+            }
             selectWordAt(offsetForPoint(e.getX(), e.getY()));
         }
 
         @Override
         public boolean onScroll(MotionEvent e1, MotionEvent e2,
                                 float dx, float dy) {
-            if (scaling) return false;
+            if (suppressSingleFingerGestures || scaling) return false;
             int nx = Math.max(0, Math.min(getScrollX() + Math.round(dx), maxScrollX()));
             int ny = Math.max(0, Math.min(getScrollY() + Math.round(dy), maxScrollY()));
             scrollTo(nx, ny);
@@ -1320,7 +1385,7 @@ public class CodeEditorView extends View
         @Override
         public boolean onFling(MotionEvent e1, MotionEvent e2,
                                float vx, float vy) {
-            if (scaling) return false;
+            if (suppressSingleFingerGestures || scaling) return false;
             scroller.fling(getScrollX(), getScrollY(),
                     Math.round(-vx), Math.round(-vy),
                     0, maxScrollX(), 0, maxScrollY());
