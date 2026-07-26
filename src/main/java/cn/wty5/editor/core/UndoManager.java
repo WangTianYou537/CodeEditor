@@ -1,4 +1,4 @@
-package com.editor.core;
+package cn.wty5.editor.core;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;

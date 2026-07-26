@@ -1,4 +1,4 @@
-package com.editor.complete;
+package cn.wty5.editor.complete;
 
 /** One completion suggestion. */
 public final class CompletionItem {

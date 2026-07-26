@@ -1,16 +1,16 @@
-import com.editor.complete.CompletionItem;
-import com.editor.complete.CompletionProvider;
-import com.editor.core.Document;
-import com.editor.lang.GrammarLexer;
-import com.editor.lang.GrammarLoader;
-import com.editor.lang.LanguageRegistry;
-import com.editor.lang.LanguageSpec;
-import com.editor.lang.Languages;
-import com.editor.lang.Lexer;
-import com.editor.lang.MiniJson;
-import com.editor.lang.TokenType;
-import com.editor.plugin.LanguagePlugin;
-import com.editor.plugin.PluginManager;
+import cn.wty5.editor.complete.CompletionItem;
+import cn.wty5.editor.complete.CompletionProvider;
+import cn.wty5.editor.core.Document;
+import cn.wty5.editor.lang.GrammarLexer;
+import cn.wty5.editor.lang.GrammarLoader;
+import cn.wty5.editor.lang.LanguageRegistry;
+import cn.wty5.editor.lang.LanguageSpec;
+import cn.wty5.editor.lang.Languages;
+import cn.wty5.editor.lang.Lexer;
+import cn.wty5.editor.lang.MiniJson;
+import cn.wty5.editor.lang.TokenType;
+import cn.wty5.editor.plugin.LanguagePlugin;
+import cn.wty5.editor.plugin.PluginManager;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -291,8 +291,8 @@ public class GrammarTest {
         File src = new File(dir, "DemoPlugin.java");
         String code = ""
                 + "package demo;\n"
-                + "import com.editor.plugin.LanguagePlugin;\n"
-                + "import com.editor.lang.LanguageSpec;\n"
+                + "import cn.wty5.editor.plugin.LanguagePlugin;\n"
+                + "import cn.wty5.editor.lang.LanguageSpec;\n"
                 + "import java.util.Arrays;\n"
                 + "public class DemoPlugin implements LanguagePlugin {\n"
                 + "  public String getName() { return \"python-lite\"; }\n"
@@ -328,7 +328,7 @@ public class GrammarTest {
         File jar = new File("build/demo-plugin.jar");
         try (JarOutputStream jos = new JarOutputStream(new FileOutputStream(jar))) {
             // service file
-            jos.putNextEntry(new JarEntry("META-INF/services/com.editor.plugin.LanguagePlugin"));
+            jos.putNextEntry(new JarEntry("META-INF/services/cn.wty5.editor.plugin.LanguagePlugin"));
             jos.write("demo.DemoPlugin\n".getBytes(StandardCharsets.UTF_8));
             jos.closeEntry();
             // class file

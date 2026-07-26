@@ -1,4 +1,4 @@
-package com.editor.lang;
+package cn.wty5.editor.lang;
 
 /**
  * Backward-compatible Java lexer.

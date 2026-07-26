@@ -1,6 +1,6 @@
-package com.editor.lang;
+package cn.wty5.editor.lang;
 
-import com.editor.plugin.LanguagePlugin;
+import cn.wty5.editor.plugin.LanguagePlugin;
 
 import java.io.File;
 import java.io.IOException;

@@ -1,11 +1,11 @@
-package com.editor.complete;
+package cn.wty5.editor.complete;
 
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
 
-import com.editor.core.Document;
-import com.editor.lang.LanguageSpec;
+import cn.wty5.editor.core.Document;
+import cn.wty5.editor.lang.LanguageSpec;
 
 import java.util.List;
 

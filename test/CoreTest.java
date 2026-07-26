@@ -1,10 +1,10 @@
-import com.editor.core.Document;
-import com.editor.core.PieceTable;
-import com.editor.core.UndoManager;
-import com.editor.lang.JavaLexer;
-import com.editor.lang.TokenType;
-import com.editor.complete.CompletionItem;
-import com.editor.complete.CompletionProvider;
+import cn.wty5.editor.core.Document;
+import cn.wty5.editor.core.PieceTable;
+import cn.wty5.editor.core.UndoManager;
+import cn.wty5.editor.lang.JavaLexer;
+import cn.wty5.editor.lang.TokenType;
+import cn.wty5.editor.complete.CompletionItem;
+import cn.wty5.editor.complete.CompletionProvider;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -379,7 +379,7 @@ public class CoreTest {
                 + "    void getThreadBinding() {}\n"
                 + "}\n"
                 + "cou");
-        CompletionProvider provider = new CompletionProvider(doc, com.editor.lang.Languages.java());
+        CompletionProvider provider = new CompletionProvider(doc, cn.wty5.editor.lang.Languages.java());
         int caret = doc.length(); // right after "cou"
         String snap = doc.toString();
         long ver = doc.version();

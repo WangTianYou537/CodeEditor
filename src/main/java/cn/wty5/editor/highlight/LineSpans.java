@@ -1,6 +1,6 @@
-package com.editor.highlight;
+package cn.wty5.editor.highlight;
 
-import com.editor.lang.TokenType;
+import cn.wty5.editor.lang.TokenType;
 
 /**
  * Highlight spans for one line, stored as parallel primitive arrays to avoid

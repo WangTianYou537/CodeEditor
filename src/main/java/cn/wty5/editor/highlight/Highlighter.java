@@ -1,12 +1,12 @@
-package com.editor.highlight;
+package cn.wty5.editor.highlight;
 
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
 
-import com.editor.core.Document;
-import com.editor.lang.Lexer;
-import com.editor.lang.TokenType;
+import cn.wty5.editor.core.Document;
+import cn.wty5.editor.lang.Lexer;
+import cn.wty5.editor.lang.TokenType;
 
 import java.util.ArrayList;
 import java.util.List;

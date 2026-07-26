@@ -1,6 +1,6 @@
-package com.editor.plugin;
+package cn.wty5.editor.plugin;
 
-import com.editor.lang.LanguageRegistry;
+import cn.wty5.editor.lang.LanguageRegistry;
 
 import java.io.File;
 import java.io.IOException;
@@ -20,7 +20,7 @@ import java.util.jar.JarFile;
  *
  * Discovery order for a jar:
  * <ol>
- *   <li>{@code META-INF/services/com.editor.plugin.LanguagePlugin}
+ *   <li>{@code META-INF/services/cn.wty5.editor.plugin.LanguagePlugin}
  *       (standard {@link ServiceLoader} entry)</li>
  *   <li>{@code META-INF/editor-plugin.txt} — one fully-qualified class name
  *       per line (fallback for simple hand-rolled jars)</li>
@@ -125,7 +125,7 @@ public final class PluginManager {
 
         // 1. ServiceLoader manifest
         try (InputStream in = loader.getResourceAsStream(
-                "META-INF/services/com.editor.plugin.LanguagePlugin")) {
+                "META-INF/services/cn.wty5.editor.plugin.LanguagePlugin")) {
             if (in != null) {
                 names.addAll(readLines(in));
             }

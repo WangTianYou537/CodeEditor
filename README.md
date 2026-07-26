@@ -8,14 +8,14 @@ ship built-in.
 ## Architecture
 
 ```
-com.editor.core       PieceTable / Document / UndoManager
-com.editor.lang       Lexer, GrammarLexer, LanguageSpec, GrammarLoader,
-                      MiniJson, LanguageRegistry, Languages, JavaLexer
-com.editor.plugin     LanguagePlugin, PluginManager
-com.editor.highlight  Highlighter (pluggable Lexer), LineSpans, ColorScheme
-com.editor.complete   CompletionEngine / Provider (driven by LanguageSpec)
-com.editor.view       CodeEditorView, EditorInputConnection, CompletionPopup
-grammars/             java.json, go.json
+cn.wty5.editor.core        PieceTable / Document / UndoManager
+cn.wty5.editor.lang        Lexer, GrammarLexer, LanguageSpec, GrammarLoader,
+                           MiniJson, LanguageRegistry, Languages, JavaLexer
+cn.wty5.editor.plugin      LanguagePlugin, PluginManager
+cn.wty5.editor.highlight   Highlighter (pluggable Lexer), LineSpans, ColorScheme
+cn.wty5.editor.complete    CompletionEngine / Provider (driven by LanguageSpec)
+cn.wty5.editor.view        CodeEditorView, EditorInputConnection, CompletionPopup
+grammars/                  java.json, go.json
 ```
 
 ## Languages: grammar files
@@ -67,7 +67,7 @@ public class PythonPlugin implements LanguagePlugin {
 }
 ```
 
-Declare the class in `META-INF/services/com.editor.plugin.LanguagePlugin`
+Declare the class in `META-INF/services/cn.wty5.editor.plugin.LanguagePlugin`
 (or `META-INF/editor-plugin.txt`) and install:
 
 ```java
@@ -132,7 +132,7 @@ Step by step without the script:
 
 ```bash
 # 1. Core (no Android):
-javac -d build/core-classes $(find src/main/java/com/editor -name '*.java' \
+javac -d build/core-classes $(find src/main/java/cn/wty5/editor -name '*.java' \
   ! -path '*/view/*' ! -name Highlighter.java ! -name CompletionEngine.java)
 javac -cp build/core-classes -d build/core-classes test/*.java
 java -cp build/core-classes CoreTest
@@ -146,7 +146,7 @@ javac --release 17 -cp "$ANDROID_JAR" -d build/android-classes \
 ## Layout
 
 ```
-src/main/java/com/editor/...   library sources
+src/main/java/cn/wty5/editor/...   library sources
 src/main/resources/grammars/   java.json, go.json (classpath)
 grammars/                      same files at project root (dev / loadFromDirectory)
 test/                          CoreTest, GrammarTest (plain JDK)

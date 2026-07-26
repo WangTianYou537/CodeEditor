@@ -1,4 +1,4 @@
-package com.editor.view;
+package cn.wty5.editor.view;
 
 import android.content.Context;
 import android.graphics.Canvas;
@@ -16,19 +16,19 @@ import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.OverScroller;
 
-import com.editor.complete.CompletionEngine;
-import com.editor.complete.CompletionItem;
-import com.editor.core.Document;
-import com.editor.core.UndoManager;
-import com.editor.highlight.ColorScheme;
-import com.editor.highlight.Highlighter;
-import com.editor.highlight.LineSpans;
-import com.editor.lang.LanguageRegistry;
-import com.editor.lang.LanguageSpec;
-import com.editor.lang.Languages;
-import com.editor.lang.Lexer;
-import com.editor.lang.TokenType;
-import com.editor.plugin.PluginManager;
+import cn.wty5.editor.complete.CompletionEngine;
+import cn.wty5.editor.complete.CompletionItem;
+import cn.wty5.editor.core.Document;
+import cn.wty5.editor.core.UndoManager;
+import cn.wty5.editor.highlight.ColorScheme;
+import cn.wty5.editor.highlight.Highlighter;
+import cn.wty5.editor.highlight.LineSpans;
+import cn.wty5.editor.lang.LanguageRegistry;
+import cn.wty5.editor.lang.LanguageSpec;
+import cn.wty5.editor.lang.Languages;
+import cn.wty5.editor.lang.Lexer;
+import cn.wty5.editor.lang.TokenType;
+import cn.wty5.editor.plugin.PluginManager;
 
 import java.io.File;
 import java.util.List;

@@ -1,4 +1,4 @@
-package com.editor.view;
+package cn.wty5.editor.view;
 
 import android.content.Context;
 import android.graphics.Canvas;
@@ -12,8 +12,8 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.PopupWindow;
 
-import com.editor.complete.CompletionItem;
-import com.editor.highlight.ColorScheme;
+import cn.wty5.editor.complete.CompletionItem;
+import cn.wty5.editor.highlight.ColorScheme;
 
 import java.util.ArrayList;
 import java.util.List;

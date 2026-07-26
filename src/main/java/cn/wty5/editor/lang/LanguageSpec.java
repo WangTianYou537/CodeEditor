@@ -1,4 +1,4 @@
-package com.editor.lang;
+package cn.wty5.editor.lang;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -9,7 +9,7 @@ import java.util.Set;
 /**
  * Declarative description of a programming language's lexical surface
  * and completion sources. Loaded from a grammar JSON file or supplied by
- * a {@link com.editor.plugin.LanguagePlugin}.
+ * a {@link cn.wty5.editor.plugin.LanguagePlugin}.
  *
  * Fields are public final so the grammar lexer can read them without
  * getters; construction always goes through {@link Builder}.

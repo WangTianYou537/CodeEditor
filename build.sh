@@ -20,7 +20,7 @@ fi
 
 echo "== core (no Android) =="
 rm -rf "$CORE_OUT" && mkdir -p "$CORE_OUT"
-find "$ROOT/src/main/java/com/editor" -name "*.java" \
+find "$ROOT/src/main/java/cn/wty5/editor" -name "*.java" \
   ! -path "*/view/*" \
   ! -path "*/highlight/Highlighter.java" \
   ! -path "*/complete/CompletionEngine.java" \

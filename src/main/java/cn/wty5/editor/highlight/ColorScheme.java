@@ -1,6 +1,6 @@
-package com.editor.highlight;
+package cn.wty5.editor.highlight;
 
-import com.editor.lang.TokenType;
+import cn.wty5.editor.lang.TokenType;
 
 /** Maps token types to ARGB colors. Default palette is a dark theme. */
 public class ColorScheme {

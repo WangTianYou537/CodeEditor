@@ -1,4 +1,4 @@
-package com.editor.view;
+package cn.wty5.editor.view;
 
 import android.view.KeyEvent;
 import android.view.inputmethod.BaseInputConnection;

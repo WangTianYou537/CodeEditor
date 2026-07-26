@@ -1,4 +1,4 @@
-package com.editor.lang;
+package cn.wty5.editor.lang;
 
 /** Token categories the color scheme maps to paints. */
 public enum TokenType {

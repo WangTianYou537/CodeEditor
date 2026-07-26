@@ -1,4 +1,4 @@
-package com.editor.lang;
+package cn.wty5.editor.lang;
 
 /**
  * Generic line-at-a-time lexer driven by a {@link LanguageSpec}.
