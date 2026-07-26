@@ -3,11 +3,13 @@ package com.editor.view;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Paint;
+import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.util.AttributeSet;
 import android.view.GestureDetector;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
+import android.view.ScaleGestureDetector;
 import android.view.View;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
@@ -39,11 +41,15 @@ import java.util.List;
  * line lookups and per-line cached spans, frame cost is proportional to the
  * viewport, not the file.
  *
- * Owns caret/selection state, IME plumbing, scrolling, undo wiring and the
- * completion popup.
+ * Owns caret/selection state, IME plumbing, scrolling, pinch-zoom, undo
+ * wiring and the completion popup.
  */
 public class CodeEditorView extends View
         implements Highlighter.Callback, CompletionEngine.Callback {
+
+    private static final float MIN_TEXT_SIZE_SP = 8f;
+    private static final float MAX_TEXT_SIZE_SP = 48f;
+    private static final float DEFAULT_TEXT_SIZE_SP = 15f;
 
     private Document document;
     private UndoManager undoManager;
@@ -67,14 +73,23 @@ public class CodeEditorView extends View
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint gutterPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint fillPaint = new Paint();
+    private final Rect visibleFrame = new Rect();
+    private float density;
+    private float textSizeSp = DEFAULT_TEXT_SIZE_SP;
     private float charWidth;
     private float lineHeight;
     private float baselineShift;
     private float gutterWidth;
+    private float gutterPad;
 
-    // -- scrolling --------------------------------------------------------
+    // -- scrolling / zoom ------------------------------------------------
     private final OverScroller scroller;
     private final GestureDetector gestureDetector;
+    private final ScaleGestureDetector scaleDetector;
+    private boolean scaling;
+    /** Anchor document position kept under the fingers during a pinch. */
+    private float zoomFocusDocX;
+    private float zoomFocusDocY;
 
     private final Runnable caretBlink = new Runnable() {
         @Override
@@ -93,20 +108,26 @@ public class CodeEditorView extends View
         super(context, attrs);
         setFocusable(true);
         setFocusableInTouchMode(true);
+        // Hardware layer: text + solid fills compose faster; pinch-zoom
+        // just invalidates content, no layer thrash on every frame.
+        setWillNotDraw(false);
 
-        float density = context.getResources().getDisplayMetrics().density;
+        density = context.getResources().getDisplayMetrics().density;
         textPaint.setTypeface(Typeface.MONOSPACE);
-        textPaint.setTextSize(15 * density);
+        textPaint.setSubpixelText(true);
+        textPaint.setLinearText(true);
         gutterPaint.setTypeface(Typeface.MONOSPACE);
-        gutterPaint.setTextSize(13 * density);
+        gutterPaint.setSubpixelText(true);
+        // SOLID style for fills — avoids accidental stroke state leaks.
+        fillPaint.setStyle(Paint.Style.FILL);
 
-        Paint.FontMetrics fm = textPaint.getFontMetrics();
-        lineHeight = fm.descent - fm.ascent + fm.leading;
-        baselineShift = -fm.ascent;
-        charWidth = textPaint.measureText("M");
+        applyTextSize(textSizeSp, false);
 
         scroller = new OverScroller(context);
         gestureDetector = new GestureDetector(context, new GestureListener());
+        scaleDetector = new ScaleGestureDetector(context, new ScaleListener());
+        // Quick-scale (double-tap-swipe) is confusing in an editor; pinch only.
+        scaleDetector.setQuickScaleEnabled(false);
 
         Languages.ensureBuiltins();
         this.language = Languages.java();
@@ -123,6 +144,9 @@ public class CodeEditorView extends View
         }
         if (completionEngine != null) {
             completionEngine.shutdown();
+        }
+        if (completionPopup != null) {
+            completionPopup.dismiss();
         }
         this.document = doc;
         this.undoManager = new UndoManager(doc);
@@ -209,6 +233,16 @@ public class CodeEditorView extends View
         return document.toString();
     }
 
+    /** Current font size in scaled pixels (sp). */
+    public float getTextSizeSp() {
+        return textSizeSp;
+    }
+
+    /** Sets font size in sp and reflows. Clamped to [{@value MIN_TEXT_SIZE_SP}, {@value MAX_TEXT_SIZE_SP}]. */
+    public void setTextSizeSp(float sp) {
+        applyTextSize(sp, true);
+    }
+
     public void undo() {
         int c = undoManager.undo();
         if (c >= 0) {
@@ -234,6 +268,52 @@ public class CodeEditorView extends View
     }
 
     // ------------------------------------------------------------------
+    // Font / zoom metrics
+    // ------------------------------------------------------------------
+
+    private void applyTextSize(float sp, boolean keepFocus) {
+        float clamped = Math.max(MIN_TEXT_SIZE_SP, Math.min(MAX_TEXT_SIZE_SP, sp));
+        // Remember the document point under the viewport centre so a
+        // programmatic size change (or end of pinch) doesn't jump.
+        float focusDocX = 0, focusDocY = 0;
+        float focusViewX = getWidth() / 2f;
+        float focusViewY = getHeight() / 2f;
+        if (keepFocus && charWidth > 0 && lineHeight > 0) {
+            focusDocX = getScrollX() + focusViewX;
+            focusDocY = getScrollY() + focusViewY;
+        }
+
+        textSizeSp = clamped;
+        float px = textSizeSp * density;
+        textPaint.setTextSize(px);
+        gutterPaint.setTextSize(px * 0.85f);
+
+        Paint.FontMetrics fm = textPaint.getFontMetrics();
+        // Quantize line height to whole pixels — stops baseline shimmer
+        // while pinching and keeps caret/selection rects pixel-aligned.
+        lineHeight = (float) Math.ceil(fm.descent - fm.ascent + fm.leading);
+        if (lineHeight < 1f) lineHeight = 1f;
+        baselineShift = -fm.ascent;
+        charWidth = textPaint.measureText("M");
+        gutterPad = charWidth * 0.75f;
+        updateGutterWidth();
+
+        if (keepFocus && charWidth > 0) {
+            int nx = Math.max(0, Math.round(focusDocX - focusViewX));
+            int ny = Math.max(0, Math.round(focusDocY - focusViewY));
+            nx = Math.min(nx, maxScrollX());
+            ny = Math.min(ny, maxScrollY());
+            scroller.forceFinished(true);
+            scrollTo(nx, ny);
+        }
+        // Popup (if showing) needs re-anchoring at the new scale.
+        if (completionPopup != null && completionPopup.isShowing()) {
+            dismissCompletions();
+        }
+        invalidate();
+    }
+
+    // ------------------------------------------------------------------
     // Editing primitives (all IME/keyboard paths funnel through these)
     // ------------------------------------------------------------------
 
@@ -243,31 +323,54 @@ public class CodeEditorView extends View
         document.insert(caret, text);
         caret += text.length();
         afterEdit();
-        requestCompletionsAtCaret();
+        // Only pop completions for identifier-ish input, not spaces/symbols
+        // that would just hide it again and steal a frame.
+        if (shouldAutoCompleteAfter(text)) {
+            requestCompletionsAtCaret();
+        } else {
+            dismissCompletions();
+        }
     }
 
     public void deleteBackward() {
         if (deleteSelectionIfAny()) {
             afterEdit();
+            dismissCompletions();
             return;
         }
         if (caret > 0) {
             document.delete(caret - 1, caret);
             caret--;
             afterEdit();
-            requestCompletionsAtCaret();
+            // Backspace updates the prefix if a popup is already up; otherwise
+            // don't spontaneously open one (avoids covering the IME mid-delete).
+            if (completionPopup != null && completionPopup.isShowing()) {
+                requestCompletionsAtCaret();
+            }
         }
     }
 
     public void deleteForward() {
         if (deleteSelectionIfAny()) {
             afterEdit();
+            dismissCompletions();
             return;
         }
         if (caret < document.length()) {
             document.delete(caret, caret + 1);
             afterEdit();
+            if (completionPopup != null && completionPopup.isShowing()) {
+                requestCompletionsAtCaret();
+            }
         }
+    }
+
+    private static boolean shouldAutoCompleteAfter(String text) {
+        if (text == null || text.isEmpty()) return false;
+        // Single identifier character → complete. Multi-char commits from the
+        // IME (e.g. CJK) also qualify if they end in an identifier part.
+        char last = text.charAt(text.length() - 1);
+        return Character.isJavaIdentifierPart(last) && !Character.isDigit(text.charAt(0));
     }
 
     private boolean deleteSelectionIfAny() {
@@ -357,7 +460,11 @@ public class CodeEditorView extends View
             caret = composingStart + text.length();
             composingStart = composingEnd = -1;
             afterEdit();
-            requestCompletionsAtCaret();
+            if (shouldAutoCompleteAfter(text)) {
+                requestCompletionsAtCaret();
+            } else {
+                dismissCompletions();
+            }
         } else {
             insertAtCaret(text);
         }
@@ -375,7 +482,8 @@ public class CodeEditorView extends View
         clampCaret();
         ensureCaretVisible();
         invalidate();
-        requestCompletionsAtCaret();
+        // Composing updates are intermediate — don't pop the completion list
+        // over the IME candidate bar on every keystroke of a CJK session.
     }
 
     void finishComposingFromIme() {
@@ -393,6 +501,9 @@ public class CodeEditorView extends View
             caret = s;
         }
         afterEdit();
+        if (completionPopup != null && completionPopup.isShowing()) {
+            requestCompletionsAtCaret();
+        }
     }
 
     CharSequence textBeforeCursor(int length) {
@@ -430,7 +541,7 @@ public class CodeEditorView extends View
         boolean ctrl = event.isCtrlPressed();
 
         // Completion popup owns navigation keys while visible.
-        if (completionPopup.isShowing()) {
+        if (completionPopup != null && completionPopup.isShowing()) {
             switch (keyCode) {
                 case KeyEvent.KEYCODE_DPAD_DOWN:
                     completionPopup.moveSelection(1);
@@ -468,24 +579,30 @@ public class CodeEditorView extends View
                 return true;
             case KeyEvent.KEYCODE_DPAD_LEFT:
                 moveCaretTo(caret - 1, shift);
+                dismissCompletions();
                 return true;
             case KeyEvent.KEYCODE_DPAD_RIGHT:
                 moveCaretTo(caret + 1, shift);
+                dismissCompletions();
                 return true;
             case KeyEvent.KEYCODE_DPAD_UP:
                 moveCaretVertically(-1, shift);
+                dismissCompletions();
                 return true;
             case KeyEvent.KEYCODE_DPAD_DOWN:
                 moveCaretVertically(1, shift);
+                dismissCompletions();
                 return true;
             case KeyEvent.KEYCODE_MOVE_HOME: {
                 int line = document.lineOfOffset(caret);
                 moveCaretTo(document.lineStart(line), shift);
+                dismissCompletions();
                 return true;
             }
             case KeyEvent.KEYCODE_MOVE_END: {
                 int line = document.lineOfOffset(caret);
                 moveCaretTo(document.lineEnd(line), shift);
+                dismissCompletions();
                 return true;
             }
             case KeyEvent.KEYCODE_Z:
@@ -508,6 +625,7 @@ public class CodeEditorView extends View
                 if (ctrl) {
                     selectionAnchor = 0;
                     caret = document.length();
+                    dismissCompletions();
                     invalidate();
                     return true;
                 }
@@ -515,6 +633,19 @@ public class CodeEditorView extends View
             case KeyEvent.KEYCODE_SPACE:
                 if (ctrl) {
                     requestCompletionsAtCaret();
+                    return true;
+                }
+                break;
+            case KeyEvent.KEYCODE_EQUALS:
+            case KeyEvent.KEYCODE_PLUS:
+                if (ctrl) {
+                    setTextSizeSp(textSizeSp + 1f);
+                    return true;
+                }
+                break;
+            case KeyEvent.KEYCODE_MINUS:
+                if (ctrl) {
+                    setTextSizeSp(textSizeSp - 1f);
                     return true;
                 }
                 break;
@@ -556,28 +687,46 @@ public class CodeEditorView extends View
     // ------------------------------------------------------------------
 
     private void requestCompletionsAtCaret() {
-        completionEngine.requestCompletions(caret);
+        if (completionEngine != null) {
+            completionEngine.requestCompletions(caret);
+        }
     }
 
     private void dismissCompletions() {
-        completionEngine.cancel();
+        if (completionEngine != null) {
+            completionEngine.cancel();
+        } else if (completionPopup != null) {
+            completionPopup.dismiss();
+        }
     }
 
     @Override
     public void onCompletions(List<CompletionItem> items, int prefixStart, String prefix) {
-        if (items.isEmpty()) {
-            completionPopup.dismiss();
+        if (items == null || items.isEmpty()) {
+            if (completionPopup != null) completionPopup.dismiss();
+            return;
+        }
+        // Don't fight the user mid-gesture.
+        if (scaling) {
             return;
         }
         this.completionPrefixStart = prefixStart;
         this.completionPrefixLength = prefix.length();
-        int[] xy = new int[2];
-        getLocationInWindow(xy);
+
+        // Caret rect in WINDOW coordinates, then clamp the popup to the
+        // visible display frame (the region above the soft keyboard).
+        int[] loc = new int[2];
+        getLocationInWindow(loc);
         int line = document.lineOfOffset(caret);
         int col = caret - document.lineStart(line);
-        int x = xy[0] + (int) (gutterWidth + col * charWidth) - getScrollX();
-        int y = xy[1] + (int) ((line + 1) * lineHeight) - getScrollY();
-        completionPopup.show(items, x, y);
+        float caretDocX = gutterWidth + col * charWidth;
+        float caretDocTop = line * lineHeight;
+        int caretX = loc[0] + Math.round(caretDocX) - getScrollX();
+        int caretTop = loc[1] + Math.round(caretDocTop) - getScrollY();
+        int caretBottom = caretTop + Math.round(lineHeight);
+
+        getWindowVisibleDisplayFrame(visibleFrame);
+        completionPopup.show(items, caretX, caretTop, caretBottom, visibleFrame);
     }
 
     private int completionPrefixStart;
@@ -609,6 +758,8 @@ public class CodeEditorView extends View
     public void onHighlightUpdated(int firstLine, int lastLine) {
         int firstVisible = (int) (getScrollY() / lineHeight);
         int lastVisible = (int) ((getScrollY() + getHeight()) / lineHeight) + 1;
+        // Only visible lines matter; with hardware acceleration a full
+        // invalidate is cheap and the 4-arg form is deprecated post-API 28.
         if (lastLine >= firstVisible && firstLine <= lastVisible) {
             invalidate();
         }
@@ -620,104 +771,158 @@ public class CodeEditorView extends View
 
     @Override
     protected void onDraw(Canvas canvas) {
+        final int scrollX = getScrollX();
+        final int scrollY = getScrollY();
+        final int viewW = getWidth();
+        final int viewH = getHeight();
+        final float lh = lineHeight;
+        final float cw = charWidth;
+        final float gw = gutterWidth;
+
         canvas.drawColor(scheme.background);
 
-        int firstLine = Math.max(0, (int) (getScrollY() / lineHeight));
-        int lastLine = Math.min(document.lineCount() - 1,
-                (int) ((getScrollY() + getHeight()) / lineHeight) + 1);
+        if (document == null || lh <= 0f || cw <= 0f) {
+            return;
+        }
+
+        final int lineCount = document.lineCount();
+        int firstLine = Math.max(0, (int) (scrollY / lh));
+        int lastLine = Math.min(lineCount - 1,
+                (int) ((scrollY + viewH) / lh) + 1);
+        if (firstLine > lastLine) {
+            drawGutter(canvas, scrollX, scrollY, viewH, firstLine, lastLine, -1);
+            return;
+        }
 
         int caretLine = document.lineOfOffset(caret);
         int selStart = hasSelection() ? Math.min(caret, selectionAnchor) : -1;
         int selEnd = hasSelection() ? Math.max(caret, selectionAnchor) : -1;
 
+        // Clip text to the content area so it slides under the gutter
+        // instead of painting over line numbers during horizontal scroll.
+        int save = canvas.save();
+        canvas.clipRect(scrollX + gw, scrollY, scrollX + viewW, scrollY + viewH);
+
         for (int line = firstLine; line <= lastLine; line++) {
-            float top = line * lineHeight;
+            float top = line * lh;
             float baseline = top + baselineShift;
             int lineStart = document.lineStart(line);
             String content = document.lineContent(line);
+            int contentLen = content.length();
 
             // Current-line highlight.
-            if (line == caretLine && !hasSelection()) {
+            if (line == caretLine && selStart < 0) {
                 fillPaint.setColor(scheme.currentLine);
-                canvas.drawRect(getScrollX() + gutterWidth, top,
-                        getScrollX() + getWidth(), top + lineHeight, fillPaint);
+                canvas.drawRect(scrollX + gw, top,
+                        scrollX + viewW, top + lh, fillPaint);
             }
 
             // Selection background for this line's overlap.
             if (selStart >= 0) {
-                int lineEnd = lineStart + content.length();
+                int lineEnd = lineStart + contentLen;
                 int s = Math.max(selStart, lineStart);
                 int e = Math.min(selEnd, lineEnd + 1); // +1 covers the '\n'
                 if (s < e) {
-                    float x1 = gutterWidth + (s - lineStart) * charWidth;
-                    float x2 = gutterWidth + (e - lineStart) * charWidth;
+                    float x1 = gw + (s - lineStart) * cw;
+                    float x2 = gw + (e - lineStart) * cw;
                     fillPaint.setColor(scheme.selection);
-                    canvas.drawRect(x1, top, x2, top + lineHeight, fillPaint);
+                    canvas.drawRect(x1, top, x2, top + lh, fillPaint);
                 }
             }
 
-            // Line number is drawn in the gutter pass below.
-
-            // Text with spans (or plain while the highlighter catches up).
+            // Text with spans. Stale spans (right after an edit, before the
+            // worker republishes) are still painted — columns are clipped to
+            // contentLen so we never read past the new line end. This is what
+            // stops the colour flash when holding backspace in a comment.
             LineSpans spans = highlighter.spansFor(line);
-            float x = gutterWidth;
-            if (spans == null || spans.size() == 0) {
-                textPaint.setColor(scheme.foreground);
-                canvas.drawText(content, x, baseline, textPaint);
-            } else {
-                int drawn = 0;
-                for (int i = 0; i < spans.size(); i++) {
-                    int s = Math.min(spans.start(i), content.length());
-                    int e = Math.min(spans.end(i), content.length());
-                    if (s >= e) {
-                        continue;
-                    }
-                    if (drawn < s) { // gap between spans (shouldn't happen, be safe)
-                        textPaint.setColor(scheme.foreground);
-                        canvas.drawText(content, drawn, s, x + drawn * charWidth,
-                                baseline, textPaint);
-                    }
-                    TokenType t = spans.type(i);
-                    if (t != TokenType.WHITESPACE) {
-                        textPaint.setColor(scheme.colorOf(t));
-                        canvas.drawText(content, s, e, x + s * charWidth,
-                                baseline, textPaint);
-                    }
-                    drawn = e;
-                }
-                if (drawn < content.length()) { // spans stale after an edit
+            if (spans == null || spans.size() == 0 || contentLen == 0) {
+                if (contentLen > 0) {
                     textPaint.setColor(scheme.foreground);
-                    canvas.drawText(content, drawn, content.length(),
-                            x + drawn * charWidth, baseline, textPaint);
+                    canvas.drawText(content, gw, baseline, textPaint);
                 }
+            } else {
+                drawSpannedLine(canvas, content, contentLen, spans, gw, baseline, cw);
             }
 
             // Caret.
             if (line == caretLine && caretVisible && isFocused()) {
-                float cx = gutterWidth + (caret - lineStart) * charWidth;
+                float cx = gw + (caret - lineStart) * cw;
                 fillPaint.setColor(scheme.caret);
-                canvas.drawRect(cx - 1, top, cx + 2, top + lineHeight, fillPaint);
+                // 2-device-px wide caret, pixel-aligned.
+                float caretW = Math.max(2f, density);
+                canvas.drawRect(cx, top, cx + caretW, top + lh, fillPaint);
             }
         }
+        canvas.restoreToCount(save);
 
-        // Gutter pass: pinned to the left edge, drawn last so horizontally
-        // scrolled text slides underneath it instead of over the numbers.
+        drawGutter(canvas, scrollX, scrollY, viewH, firstLine, lastLine, caretLine);
+    }
+
+    /**
+     * Paints one line from its span list. Spans whose columns fall past
+     * {@code contentLen} (stale after a delete) are clipped; gaps are filled
+     * with the default foreground so a partially-updated line never shows
+     * holes.
+     */
+    private void drawSpannedLine(Canvas canvas, String content, int contentLen,
+                                 LineSpans spans, float x0, float baseline,
+                                 float cw) {
+        int drawn = 0;
+        int n = spans.size();
+        for (int i = 0; i < n; i++) {
+            int s = spans.start(i);
+            int e = spans.end(i);
+            if (s < 0) s = 0;
+            if (e > contentLen) e = contentLen;
+            if (s >= e) continue;
+            if (s > contentLen) break;
+
+            if (drawn < s) {
+                textPaint.setColor(scheme.foreground);
+                canvas.drawText(content, drawn, s, x0 + drawn * cw, baseline, textPaint);
+            }
+            TokenType t = spans.type(i);
+            if (t != TokenType.WHITESPACE) {
+                textPaint.setColor(scheme.colorOf(t));
+                canvas.drawText(content, s, e, x0 + s * cw, baseline, textPaint);
+            }
+            drawn = e;
+        }
+        if (drawn < contentLen) {
+            textPaint.setColor(scheme.foreground);
+            canvas.drawText(content, drawn, contentLen,
+                    x0 + drawn * cw, baseline, textPaint);
+        }
+    }
+
+    private void drawGutter(Canvas canvas, int scrollX, int scrollY, int viewH,
+                            int firstLine, int lastLine, int caretLine) {
         fillPaint.setColor(scheme.gutterBackground);
-        canvas.drawRect(getScrollX(), getScrollY(),
-                getScrollX() + gutterWidth, getScrollY() + getHeight(), fillPaint);
+        canvas.drawRect(scrollX, scrollY,
+                scrollX + gutterWidth, scrollY + viewH, fillPaint);
+
+        if (firstLine > lastLine || lineHeight <= 0f) return;
+
+        final float rightPad = gutterPad;
         for (int line = firstLine; line <= lastLine; line++) {
             float baseline = line * lineHeight + baselineShift;
             gutterPaint.setColor(line == caretLine
                     ? scheme.gutterCurrentText : scheme.gutterText);
             String num = Integer.toString(line + 1);
             float numWidth = gutterPaint.measureText(num);
-            canvas.drawText(num, getScrollX() + gutterWidth - numWidth - charWidth * 0.75f,
+            canvas.drawText(num,
+                    scrollX + gutterWidth - numWidth - rightPad,
                     baseline, gutterPaint);
         }
     }
 
     private void updateGutterWidth() {
+        if (document == null || gutterPaint.getTextSize() <= 0f) {
+            gutterWidth = 0;
+            return;
+        }
         int digits = Math.max(2, Integer.toString(document.lineCount()).length());
+        // measureText("0") * digits is stable under monospace; cache-friendly.
         gutterWidth = digits * gutterPaint.measureText("0") + charWidth * 1.5f;
     }
 
@@ -727,8 +932,26 @@ public class CodeEditorView extends View
 
     @Override
     public boolean onTouchEvent(MotionEvent event) {
+        // Scale detector first so a two-finger pinch isn't also interpreted
+        // as a scroll by the gesture detector.
+        scaleDetector.onTouchEvent(event);
+
+        int action = event.getActionMasked();
+        if (action == MotionEvent.ACTION_POINTER_DOWN && event.getPointerCount() >= 2) {
+            scaling = true;
+            scroller.forceFinished(true);
+            dismissCompletions();
+        }
+        if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            scaling = false;
+        }
+        // While pinching, swallow one-finger gestures entirely.
+        if (scaling || event.getPointerCount() > 1) {
+            return true;
+        }
+
         boolean handled = gestureDetector.onTouchEvent(event);
-        if (event.getActionMasked() == MotionEvent.ACTION_UP && !handled) {
+        if (action == MotionEvent.ACTION_UP && !handled) {
             performClick();
         }
         return true;
@@ -757,16 +980,16 @@ public class CodeEditorView extends View
     }
 
     private int maxScrollY() {
+        if (lineHeight <= 0f) return 0;
         return (int) Math.max(0, document.lineCount() * lineHeight - getHeight() / 2f);
     }
 
     private int maxScrollX() {
-        // Cheap upper bound: longest visible line would be exact but costly;
-        // allow generous horizontal room instead.
-        return (int) (200 * charWidth);
+        return (int) Math.max(0, 200 * charWidth);
     }
 
     private void ensureCaretVisible() {
+        if (lineHeight <= 0f || charWidth <= 0f || getWidth() == 0) return;
         int line = document.lineOfOffset(caret);
         int col = caret - document.lineStart(line);
         float top = line * lineHeight;
@@ -785,9 +1008,11 @@ public class CodeEditorView extends View
         } else if (x > sx + getWidth() - charWidth * 2) {
             sx = (int) (x - getWidth() + charWidth * 6);
         }
+        sx = Math.max(0, Math.min(sx, maxScrollX()));
+        sy = Math.max(0, Math.min(sy, maxScrollY()));
         if (sx != getScrollX() || sy != getScrollY()) {
             scroller.forceFinished(true);
-            scrollTo(Math.max(0, sx), Math.max(0, sy));
+            scrollTo(sx, sy);
         }
     }
 
@@ -811,12 +1036,97 @@ public class CodeEditorView extends View
     }
 
     @Override
+    protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+        super.onSizeChanged(w, h, oldw, oldh);
+        // IME show/hide resizes us via windowInsets / adjustablePan alternatives;
+        // re-clamp scroll and re-anchor the popup if it's up.
+        int sx = Math.min(getScrollX(), maxScrollX());
+        int sy = Math.min(getScrollY(), maxScrollY());
+        if (sx != getScrollX() || sy != getScrollY()) {
+            scrollTo(sx, sy);
+        }
+        if (completionPopup != null && completionPopup.isShowing()) {
+            // Re-query with the new visible frame so the popup climbs above
+            // a newly shown keyboard instead of sitting on top of it.
+            requestCompletionsAtCaret();
+        }
+    }
+
+    @Override
     protected void onDetachedFromWindow() {
         super.onDetachedFromWindow();
         removeCallbacks(caretBlink);
-        completionPopup.dismiss();
-        highlighter.shutdown();
-        completionEngine.shutdown();
+        if (completionPopup != null) completionPopup.dismiss();
+        if (highlighter != null) highlighter.shutdown();
+        if (completionEngine != null) completionEngine.shutdown();
+    }
+
+    // ------------------------------------------------------------------
+    // Gesture listeners
+    // ------------------------------------------------------------------
+
+    private final class ScaleListener extends ScaleGestureDetector.SimpleOnScaleGestureListener {
+
+        @Override
+        public boolean onScaleBegin(ScaleGestureDetector detector) {
+            scaling = true;
+            scroller.forceFinished(true);
+            dismissCompletions();
+            // Document point currently under the pinch focus.
+            zoomFocusDocX = getScrollX() + detector.getFocusX();
+            zoomFocusDocY = getScrollY() + detector.getFocusY();
+            return true;
+        }
+
+        @Override
+        public boolean onScale(ScaleGestureDetector detector) {
+            float factor = detector.getScaleFactor();
+            if (Float.isNaN(factor) || Float.isInfinite(factor) || factor <= 0f) {
+                return false;
+            }
+            float newSp = textSizeSp * factor;
+            // Hard clamp before applying so a fling-pinch doesn't overshoot
+            // and then feel sticky against the stop.
+            if (newSp < MIN_TEXT_SIZE_SP) newSp = MIN_TEXT_SIZE_SP;
+            if (newSp > MAX_TEXT_SIZE_SP) newSp = MAX_TEXT_SIZE_SP;
+            if (Math.abs(newSp - textSizeSp) < 0.01f) {
+                return true;
+            }
+
+            // Recompute metrics, then keep the original document point locked
+            // under the (possibly moving) focus fingers.
+            textSizeSp = newSp;
+            float px = textSizeSp * density;
+            textPaint.setTextSize(px);
+            gutterPaint.setTextSize(px * 0.85f);
+            Paint.FontMetrics fm = textPaint.getFontMetrics();
+            lineHeight = (float) Math.ceil(fm.descent - fm.ascent + fm.leading);
+            if (lineHeight < 1f) lineHeight = 1f;
+            baselineShift = -fm.ascent;
+            charWidth = textPaint.measureText("M");
+            gutterPad = charWidth * 0.75f;
+            updateGutterWidth();
+
+            float focusX = detector.getFocusX();
+            float focusY = detector.getFocusY();
+            int nx = Math.round(zoomFocusDocX - focusX);
+            int ny = Math.round(zoomFocusDocY - focusY);
+            nx = Math.max(0, Math.min(nx, maxScrollX()));
+            ny = Math.max(0, Math.min(ny, maxScrollY()));
+            scrollTo(nx, ny);
+            invalidate();
+            return true;
+        }
+
+        @Override
+        public void onScaleEnd(ScaleGestureDetector detector) {
+            scaling = false;
+            // Snap scroll to legal range once more after the last factor.
+            int nx = Math.max(0, Math.min(getScrollX(), maxScrollX()));
+            int ny = Math.max(0, Math.min(getScrollY(), maxScrollY()));
+            scrollTo(nx, ny);
+            invalidate();
+        }
     }
 
     private final class GestureListener extends GestureDetector.SimpleOnGestureListener {
@@ -854,17 +1164,23 @@ public class CodeEditorView extends View
         @Override
         public boolean onScroll(MotionEvent e1, MotionEvent e2,
                                 float dx, float dy) {
-            int nx = Math.max(0, Math.min(getScrollX() + (int) dx, maxScrollX()));
-            int ny = Math.max(0, Math.min(getScrollY() + (int) dy, maxScrollY()));
+            if (scaling) return false;
+            int nx = Math.max(0, Math.min(getScrollX() + Math.round(dx), maxScrollX()));
+            int ny = Math.max(0, Math.min(getScrollY() + Math.round(dy), maxScrollY()));
             scrollTo(nx, ny);
+            // Keep a showing popup glued to the caret while the user pans.
+            if (completionPopup != null && completionPopup.isShowing()) {
+                dismissCompletions();
+            }
             return true;
         }
 
         @Override
         public boolean onFling(MotionEvent e1, MotionEvent e2,
                                float vx, float vy) {
+            if (scaling) return false;
             scroller.fling(getScrollX(), getScrollY(),
-                    (int) -vx, (int) -vy,
+                    Math.round(-vx), Math.round(-vy),
                     0, maxScrollX(), 0, maxScrollY());
             postInvalidateOnAnimation();
             return true;

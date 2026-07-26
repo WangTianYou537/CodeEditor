@@ -8,8 +8,14 @@ CORE_OUT="$ROOT/build/core-classes"
 
 if [[ ! -f "$ANDROID_JAR" ]]; then
   echo "android.jar not found at $ANDROID_JAR" >&2
-  echo "Download platform 35, or set ANDROID_JAR." >&2
-  exit 1
+  if [[ -x "$ROOT/scripts/fetch-android-platform.sh" ]]; then
+    echo "fetching platform 35 ..." >&2
+    "$ROOT/scripts/fetch-android-platform.sh" 35
+  else
+    echo "Run: ./scripts/fetch-android-platform.sh 35" >&2
+    echo "Or set ANDROID_JAR to an existing platform android.jar." >&2
+    exit 1
+  fi
 fi
 
 echo "== core (no Android) =="

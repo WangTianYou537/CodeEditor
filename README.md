@@ -109,11 +109,28 @@ String text = editor.getText();
 
 ## Build & test
 
-```bash
-# One-shot: core tests + full compile against android.jar
-./build.sh
+The Android platform package is **not** in git (it is ~100 MB+ and
+redistributable only under the Android SDK license). Fetch `android.jar`
+once, then build:
 
-# Or step by step —
+```bash
+# Downloads platform-35 android.jar into android-sdk/ (gitignored)
+./scripts/fetch-android-platform.sh 35
+
+# Core tests (plain JDK) + full compile against android.jar
+./build.sh
+```
+
+Or point at an existing SDK install:
+
+```bash
+export ANDROID_JAR=$ANDROID_HOME/platforms/android-35/android.jar
+./build.sh
+```
+
+Step by step without the script:
+
+```bash
 # 1. Core (no Android):
 javac -d build/core-classes $(find src/main/java/com/editor -name '*.java' \
   ! -path '*/view/*' ! -name Highlighter.java ! -name CompletionEngine.java)
@@ -121,15 +138,10 @@ javac -cp build/core-classes -d build/core-classes test/*.java
 java -cp build/core-classes CoreTest
 java -cp build/core-classes GrammarTest
 
-# 2. Full tree vs Android platform 35:
-javac --release 17 \
-  -cp android-sdk/platforms/android-35/android.jar \
-  -d build/android-classes $(find src -name '*.java')
+# 2. Full tree vs platform jar:
+javac --release 17 -cp "$ANDROID_JAR" -d build/android-classes \
+  $(find src -name '*.java')
 ```
-
-The Android platform jar was fetched from
-`https://dl.google.com/android/repository/platform-35_r01.zip` into
-`android-sdk/platforms/android-35/`.
 
 ## Layout
 
@@ -138,6 +150,8 @@ src/main/java/com/editor/...   library sources
 src/main/resources/grammars/   java.json, go.json (classpath)
 grammars/                      same files at project root (dev / loadFromDirectory)
 test/                          CoreTest, GrammarTest (plain JDK)
-android-sdk/                   platform-35 android.jar
+scripts/fetch-android-platform.sh
 build.sh                       compile + test entry point
+android-sdk/                   local only (gitignored) — platform android.jar
+build/                         local only (gitignored) — class output
 ```

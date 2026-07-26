@@ -21,6 +21,11 @@ import java.util.List;
  * UI thread; stale results (document changed meanwhile) are dropped by
  * version check and the edit is re-processed.
  *
+ * <p><b>No-flash policy:</b> edits never clear cached spans to {@code null}.
+ * The renderer keeps painting the previous colours (clipped to the new line
+ * length) until fresh spans arrive. That eliminates the plain-text flicker
+ * seen when holding backspace inside a comment or string.
+ *
  * The {@link Lexer} is pluggable — swap it (via {@link #setLexer}) when the
  * user changes language; that invalidates the whole span cache.
  *
@@ -81,7 +86,11 @@ public final class Highlighter implements Document.ContentListener {
         workerThread.quitSafely();
     }
 
-    /** Spans for a line, or null while it hasn't been lexed yet. */
+    /**
+     * Spans for a line. May be slightly stale right after an edit (still
+     * safe to paint — the view clips columns to the current line length).
+     * Returns null only for never-lexed lines.
+     */
     public LineSpans spansFor(int line) {
         return line < lines.size() ? lines.get(line) : null;
     }
@@ -104,11 +113,10 @@ public final class Highlighter implements Document.ContentListener {
     public void onInsert(Document doc, int offset, String text) {
         int line = doc.lineOfOffset(offset);
         int newLines = countNewlines(text);
+        // Splice in slots for brand-new lines. Keep the edited line's old
+        // spans so the renderer doesn't flash to plain foreground.
         for (int i = 0; i < newLines; i++) {
             lines.add(Math.min(line + 1, lines.size()), null);
-        }
-        if (line < lines.size()) {
-            lines.set(line, null);
         }
         markDirty(line, line + newLines);
     }
@@ -120,9 +128,9 @@ public final class Highlighter implements Document.ContentListener {
         for (int i = 0; i < removed && line + 1 < lines.size(); i++) {
             lines.remove(line + 1);
         }
-        if (line < lines.size()) {
-            lines.set(line, null);
-        }
+        // Intentionally do NOT null lines.get(line): stale spans stay until
+        // the worker publishes replacements. Holding backspace inside a
+        // block comment used to blank the colour on every keystroke.
         markDirty(line, line);
     }
 

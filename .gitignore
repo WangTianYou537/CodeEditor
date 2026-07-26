@@ -1,0 +1,36 @@
+# Build outputs
+/build/
+*.class
+*.jar
+!grammars/**
+*.war
+*.ear
+
+# Android SDK / platform packages (download via ./scripts/fetch-android-platform.sh)
+/android-sdk/
+*.zip
+
+# Compile-time Android API stubs (optional local aid; not part of the library)
+/stubs/
+
+# IDE / OS
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Gradle / local config if added later
+.gradle/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Test scratch
+/tmp/
