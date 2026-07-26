@@ -69,17 +69,22 @@ public class CodeEditorView extends View
     private boolean caretVisible = true;
 
     /** Which selection handle is being dragged, if any. */
-    private enum Handle { NONE, START, END, CURSOR }
+    private enum Handle { NONE, START, END }
     private Handle activeHandle = Handle.NONE;
     /**
-     * After a long-press word select, subsequent MOVE events extend the
-     * selection end until the finger lifts (no need to hit a handle first).
+     * After a long-press / double-tap word select, subsequent MOVE events
+     * extend the selection end until the finger lifts.
      */
-    private boolean longPressSelecting;
-    /** Touch slop squared — distinguish tap from drag. */
+    private boolean fingerSelecting;
     private int touchSlop;
     private float downX, downY;
     private boolean touchMoved;
+    /** Timestamp of last plain tap UP — used for manual double-tap detection. */
+    private long lastTapUpMs;
+    private float lastTapX, lastTapY;
+    /** True once a double-tap was recognised in this DOWN/UP cycle. */
+    private boolean doubleTapHandled;
+    private final Runnable longPressRunnable = this::onLongPressTimeout;
 
     // -- composing region for IME (simplified) ---------------------------
     private int composingStart = -1;
@@ -169,10 +174,9 @@ public class CodeEditorView extends View
         scroller = new OverScroller(context);
         GestureListener gestures = new GestureListener();
         gestureDetector = new GestureDetector(context, gestures);
-        // SimpleOnGestureListener already implements OnDoubleTapListener;
-        // set it explicitly so confirmed-single-tap / double-tap are delivered.
-        gestureDetector.setOnDoubleTapListener(gestures);
-        gestureDetector.setIsLongpressEnabled(true);
+        // We handle tap / double-tap / long-press ourselves (see onTouchEvent).
+        // GestureDetector is only used for scroll + fling.
+        gestureDetector.setIsLongpressEnabled(false);
         scaleDetector = new ScaleGestureDetector(context, new ScaleListener());
         // Quick-scale (double-tap-swipe) is confusing in an editor; pinch only.
         scaleDetector.setQuickScaleEnabled(false);
@@ -468,7 +472,7 @@ public class CodeEditorView extends View
         }
         caret = offset;
         activeHandle = Handle.NONE;
-        longPressSelecting = false;
+        fingerSelecting = false;
         undoManager.sealCurrent(); // caret jump ends the typing merge run
         ensureCaretVisible();
         resetCaretBlink();
@@ -482,7 +486,11 @@ public class CodeEditorView extends View
         moveCaretTo(document.offsetAt(target, col), extend);
     }
 
-    /** Selects the identifier/word under the given offset. */
+    /**
+     * Selects the word (identifier run) under {@code offset}. Falls back to a
+     * single character when the touch is on whitespace/punctuation. Always
+     * leaves {@link #hasSelection()} true so the handles appear.
+     */
     private void selectWordAt(int offset) {
         if (document == null || document.length() == 0) {
             selectionAnchor = -1;
@@ -491,39 +499,52 @@ public class CodeEditorView extends View
             return;
         }
         offset = Math.max(0, Math.min(offset, document.length()));
-        int s = offset;
-        int e = offset;
-        // Prefer the character under / just before the touch when at EOF.
         int probe = offset < document.length() ? offset
                 : Math.max(0, offset - 1);
         char pc = document.charAt(probe);
+        int s;
+        int e;
         if (isWordChar(pc)) {
             s = probe;
             e = probe + 1;
             while (s > 0 && isWordChar(document.charAt(s - 1))) s--;
             while (e < document.length() && isWordChar(document.charAt(e))) e++;
-        } else {
-            // Non-word: expand over a run of identical whitespace / punctuation,
-            // otherwise just take the single character.
+        } else if (Character.isWhitespace(pc)) {
             s = probe;
             e = probe + 1;
-            if (Character.isWhitespace(pc)) {
-                while (s > 0 && Character.isWhitespace(document.charAt(s - 1))) s--;
-                while (e < document.length()
-                        && Character.isWhitespace(document.charAt(e))) e++;
+            while (s > 0 && Character.isWhitespace(document.charAt(s - 1))) s--;
+            while (e < document.length()
+                    && Character.isWhitespace(document.charAt(e))) e++;
+            // A pure-whitespace "word" is rarely useful — take one char.
+            if (e - s > 1) {
+                s = probe;
+                e = probe + 1;
             }
+        } else {
+            s = probe;
+            e = probe + 1;
+        }
+        if (s == e) {
+            // Absolute last resort so hasSelection() is true and handles show.
+            e = Math.min(document.length(), s + 1);
+            if (s == e && s > 0) s--;
         }
         selectionAnchor = s;
         caret = e;
         activeHandle = Handle.NONE;
         ensureCaretVisible();
         resetCaretBlink();
-        performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+        // Haptic may be disabled on some devices / emulators — never fatal.
+        try {
+            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+        } catch (Exception ignored) {
+        }
         invalidate();
     }
 
     private static boolean isWordChar(char c) {
-        return Character.isJavaIdentifierPart(c) || c == '$' || c == '\'';
+        return Character.isLetterOrDigit(c) || c == '_' || c == '$'
+                || Character.isJavaIdentifierPart(c);
     }
 
     private int selectionStart() {
@@ -537,34 +558,23 @@ public class CodeEditorView extends View
     }
 
     /**
-     * Hit-tests the start / end selection handles (or the bare caret handle
-     * when there is no selection). Returns {@link Handle#NONE} on a miss.
-     * Coordinates are view-local.
+     * Hit-tests the start / end selection handles. Only active while there
+     * is a real selection — a bare caret must NOT steal taps that should
+     * become double-tap / long-press word selects.
      */
     private Handle hitTestHandle(float viewX, float viewY) {
-        if (document == null || lineHeight <= 0f || charWidth <= 0f) {
+        if (!hasSelection() || document == null
+                || lineHeight <= 0f || charWidth <= 0f) {
             return Handle.NONE;
         }
-        // Generous touch target around the drawn handle circle.
-        float hitR = handleRadius * 2.2f;
+        float hitR = handleRadius * 2.4f;
         float hitR2 = hitR * hitR;
-
-        if (hasSelection()) {
-            float[] start = handleViewPos(selectionStart(), /*start*/ true);
-            float[] end = handleViewPos(selectionEnd(), /*start*/ false);
-            float ds = dist2(viewX, viewY, start[0], start[1]);
-            float de = dist2(viewX, viewY, end[0], end[1]);
-            if (ds <= hitR2 || de <= hitR2) {
-                return ds <= de ? Handle.START : Handle.END;
-            }
-            return Handle.NONE;
-        }
-
-        // No selection: optional caret handle just below the caret so the user
-        // can drag to start a selection without a long-press.
-        float[] cur = handleViewPos(caret, /*start*/ false);
-        if (dist2(viewX, viewY, cur[0], cur[1]) <= hitR2) {
-            return Handle.CURSOR;
+        float[] start = handleViewPos(selectionStart(), true);
+        float[] end = handleViewPos(selectionEnd(), false);
+        float ds = dist2(viewX, viewY, start[0], start[1]);
+        float de = dist2(viewX, viewY, end[0], end[1]);
+        if (ds <= hitR2 || de <= hitR2) {
+            return ds <= de ? Handle.START : Handle.END;
         }
         return Handle.NONE;
     }
@@ -574,10 +584,9 @@ public class CodeEditorView extends View
         int line = document.lineOfOffset(offset);
         int col = offset - document.lineStart(line);
         float x = gutterWidth + col * charWidth - getScrollX();
-        // Start handle sits above the line; end/caret handle sits below.
         float y = startHandle
-                ? line * lineHeight - getScrollY() - handleRadius * 0.2f
-                : (line + 1) * lineHeight - getScrollY() + handleRadius * 0.2f;
+                ? line * lineHeight - getScrollY() - handleRadius * 0.55f
+                : (line + 1) * lineHeight - getScrollY() + handleRadius * 0.55f;
         return new float[]{x, y};
     }
 
@@ -587,58 +596,62 @@ public class CodeEditorView extends View
         return dx * dx + dy * dy;
     }
 
-    /** Moves the active handle / long-press selection end to {@code viewX/Y}. */
+    /**
+     * Moves the dragged end of the selection to the document offset under
+     * {@code (viewX, viewY)}. Keeps anchor as the fixed end; swaps roles
+     * transparently when the finger crosses.
+     */
     private void dragSelectionTo(float viewX, float viewY) {
+        if (document == null) return;
         int offset = offsetForPoint(viewX, viewY);
+        offset = Math.max(0, Math.min(offset, document.length()));
+
         if (activeHandle == Handle.START) {
-            int end = selectionEnd();
-            // Keep at least one char of selection; swap roles if crossed.
+            int end = Math.max(caret, selectionAnchor);
             if (offset >= end) {
-                selectionAnchor = end;
-                caret = Math.min(document.length(), offset == end ? end + 0 : offset);
-                // Crossed: finger is now dragging what was the end.
-                if (caret < selectionAnchor) {
-                    int t = caret; caret = selectionAnchor; selectionAnchor = t;
-                }
-                // After crossing, treat subsequent moves as END.
-                if (offset > end) activeHandle = Handle.END;
+                // Crossed the end — pin start at end-1 and flip to END drag.
+                selectionAnchor = Math.max(0, end - 1);
+                caret = offset;
+                activeHandle = Handle.END;
             } else {
                 selectionAnchor = offset;
                 caret = end;
             }
-        } else if (activeHandle == Handle.END || activeHandle == Handle.CURSOR
-                || longPressSelecting) {
-            int start = selectionStart();
-            if (activeHandle == Handle.CURSOR && !hasSelection()) {
-                // First move off the bare caret → begin a real selection.
+        } else { // END or fingerSelecting without an explicit handle
+            int start = selectionAnchor >= 0
+                    ? Math.min(caret, selectionAnchor)
+                    : caret;
+            if (selectionAnchor < 0) {
                 selectionAnchor = caret;
-                activeHandle = Handle.END;
-                start = selectionAnchor;
-            }
-            if (longPressSelecting && selectionAnchor < 0) {
-                selectionAnchor = caret;
-                start = selectionAnchor;
+                start = caret;
             }
             if (offset <= start) {
-                caret = start;
                 selectionAnchor = offset;
-                if (offset < start) activeHandle = Handle.START;
+                caret = start;
+                activeHandle = Handle.START;
             } else {
                 selectionAnchor = start;
                 caret = offset;
                 activeHandle = Handle.END;
             }
         }
-        // Normalise so anchor is always the start and caret the end while
-        // dragging — keeps hasSelection() true and drawing simple. We swap
-        // freely above; just clamp.
         caret = Math.max(0, Math.min(caret, document.length()));
-        if (selectionAnchor >= 0) {
-            selectionAnchor = Math.max(0, Math.min(selectionAnchor, document.length()));
-        }
+        selectionAnchor = Math.max(0, Math.min(selectionAnchor, document.length()));
         ensureCaretVisible();
         resetCaretBlink();
         invalidate();
+    }
+
+    /** Fired from the posted long-press runnable. */
+    private void onLongPressTimeout() {
+        if (suppressSingleFingerGestures || scaling || touchMoved) return;
+        if (activeHandle != Handle.NONE) return;
+        requestFocus();
+        selectWordAt(offsetForPoint(downX, downY));
+        dismissCompletions();
+        fingerSelecting = true;
+        activeHandle = Handle.END;
+        doubleTapHandled = true; // suppress the upcoming tap-up
     }
 
     // ------------------------------------------------------------------
@@ -1055,16 +1068,12 @@ public class CodeEditorView extends View
         }
     }
 
-    /** Teardrop handles at the selection ends (or a single caret handle). */
+    /** Teardrop handles at the selection ends — only while a range is selected. */
     private void drawSelectionHandles(Canvas canvas) {
+        if (!hasSelection()) return;
         handlePaint.setColor(scheme.selectionHandle);
-        if (hasSelection()) {
-            drawHandleAt(canvas, selectionStart(), /*start*/ true);
-            drawHandleAt(canvas, selectionEnd(), /*start*/ false);
-        } else if (caretVisible) {
-            // Subtle caret handle so the user can drag to create a selection.
-            drawHandleAt(canvas, caret, /*start*/ false);
-        }
+        drawHandleAt(canvas, selectionStart(), /*start*/ true);
+        drawHandleAt(canvas, selectionEnd(), /*start*/ false);
     }
 
     private void drawHandleAt(Canvas canvas, int offset, boolean startHandle) {
@@ -1168,101 +1177,158 @@ public class CodeEditorView extends View
     // Touch & scrolling
     // ------------------------------------------------------------------
 
+    private static final int DOUBLE_TAP_TIMEOUT_MS = 300;
+    private static final int LONG_PRESS_TIMEOUT_MS = 400;
+
+    private final Runnable singleTapRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (suppressSingleFingerGestures || scaling) return;
+            requestFocus();
+            moveCaretTo(offsetForPoint(downX, downY), false);
+            dismissCompletions();
+            InputMethodManager imm = (InputMethodManager)
+                    getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null) {
+                imm.showSoftInput(CodeEditorView.this, 0);
+            }
+        }
+    };
+
     @Override
     public boolean onTouchEvent(MotionEvent event) {
-        // Scale detector first so a two-finger pinch isn't also interpreted
-        // as a scroll by the gesture detector.
         scaleDetector.onTouchEvent(event);
 
         final int action = event.getActionMasked();
         final int pointerCount = event.getPointerCount();
+        final float x = event.getX();
+        final float y = event.getY();
 
-        // Second (or later) finger down → this touch sequence is a multi-touch
-        // session. Freeze scrolling, drop completions, and CANCEL the single-
-        // finger GestureDetector so its pending DOWN cannot become a tap when
-        // the last finger finally lifts.
+        // ---- multi-touch / pinch -----------------------------------------
         if (action == MotionEvent.ACTION_POINTER_DOWN && pointerCount >= 2) {
             beginMultiTouchSession(event);
+            cancelPendingTaps();
             activeHandle = Handle.NONE;
-            longPressSelecting = false;
+            fingerSelecting = false;
+            return true;
         }
-
-        // Handle / long-press drag takes priority over pan-scroll for the
-        // rest of this pointer sequence.
-        if (action == MotionEvent.ACTION_DOWN && pointerCount == 1
-                && !suppressSingleFingerGestures && !scaling) {
-            downX = event.getX();
-            downY = event.getY();
-            touchMoved = false;
-            Handle hit = hitTestHandle(event.getX(), event.getY());
-            if (hit != Handle.NONE) {
-                activeHandle = hit;
-                longPressSelecting = false;
-                scroller.forceFinished(true);
-                dismissCompletions();
-                // Still feed DOWN to GestureDetector so it stays in sync,
-                // but we will consume MOVE/UP ourselves.
-                gestureDetector.onTouchEvent(event);
-                return true;
-            }
-        }
-
-        if ((activeHandle != Handle.NONE || longPressSelecting)
-                && pointerCount == 1
-                && !suppressSingleFingerGestures) {
-            switch (action) {
-                case MotionEvent.ACTION_MOVE:
-                    if (!touchMoved) {
-                        float dx = event.getX() - downX;
-                        float dy = event.getY() - downY;
-                        if (dx * dx + dy * dy > touchSlop * touchSlop) {
-                            touchMoved = true;
-                        }
-                    }
-                    if (touchMoved || activeHandle != Handle.NONE) {
-                        dragSelectionTo(event.getX(), event.getY());
-                    }
-                    return true;
-                case MotionEvent.ACTION_UP:
-                case MotionEvent.ACTION_CANCEL:
-                    activeHandle = Handle.NONE;
-                    longPressSelecting = false;
-                    // Don't let GestureDetector see this UP as a tap.
-                    dispatchGestureCancel(event);
-                    invalidate();
-                    return true;
-                default:
-                    break;
-            }
-        }
-
-        // All fingers up — end the multi-touch session. Do NOT forward this
-        // UP to the GestureDetector if we were multi-touching: that is
-        // exactly what used to relocate the caret after a pinch-zoom.
-        if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
-            boolean blocked = suppressSingleFingerGestures || scaling
-                    || scaleDetector.isInProgress();
-            scaling = false;
-            suppressSingleFingerGestures = false;
-            activeHandle = Handle.NONE;
-            longPressSelecting = false;
-            if (blocked) {
-                dispatchGestureCancel(event);
-                return true;
-            }
-        }
-
-        // Mid-pinch / multi-touch: swallow everything single-finger would use.
         if (suppressSingleFingerGestures || scaling
                 || pointerCount > 1 || scaleDetector.isInProgress()) {
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                scaling = false;
+                suppressSingleFingerGestures = false;
+                dispatchGestureCancel(event);
+            }
             return true;
         }
 
-        boolean handled = gestureDetector.onTouchEvent(event);
-        if (action == MotionEvent.ACTION_UP && !handled) {
-            performClick();
+        // ---- single-finger ------------------------------------------------
+        switch (action) {
+            case MotionEvent.ACTION_DOWN: {
+                downX = x;
+                downY = y;
+                touchMoved = false;
+                doubleTapHandled = false;
+                scroller.forceFinished(true);
+
+                // A new gesture supersedes any pending single-tap from a
+                // previous UP (critical for double-tap: the 2nd DOWN must
+                // cancel the 1st tap's deferred caret-move).
+                removeCallbacks(singleTapRunnable);
+
+                // Only hit-test handles when a selection is already showing.
+                Handle hit = hitTestHandle(x, y);
+                if (hit != Handle.NONE) {
+                    activeHandle = hit;
+                    fingerSelecting = false;
+                    removeCallbacks(longPressRunnable);
+                    dismissCompletions();
+                    return true;
+                }
+
+                activeHandle = Handle.NONE;
+                fingerSelecting = false;
+                // Arm long-press; cancelled on move / up / multi-touch.
+                removeCallbacks(longPressRunnable);
+                postDelayed(longPressRunnable, LONG_PRESS_TIMEOUT_MS);
+                // Let GestureDetector track for scroll/fling.
+                gestureDetector.onTouchEvent(event);
+                return true;
+            }
+
+            case MotionEvent.ACTION_MOVE: {
+                if (activeHandle != Handle.NONE || fingerSelecting) {
+                    dragSelectionTo(x, y);
+                    return true;
+                }
+                float dx = x - downX;
+                float dy = y - downY;
+                if (!touchMoved && dx * dx + dy * dy > touchSlop * touchSlop) {
+                    touchMoved = true;
+                    cancelPendingTaps(); // no long-press / single-tap after a drag
+                }
+                gestureDetector.onTouchEvent(event);
+                return true;
+            }
+
+            case MotionEvent.ACTION_UP: {
+                removeCallbacks(longPressRunnable);
+
+                if (activeHandle != Handle.NONE || fingerSelecting) {
+                    activeHandle = Handle.NONE;
+                    fingerSelecting = false;
+                    dispatchGestureCancel(event);
+                    invalidate();
+                    return true;
+                }
+
+                gestureDetector.onTouchEvent(event);
+
+                if (!touchMoved && !doubleTapHandled
+                        && !suppressSingleFingerGestures && !scaling) {
+                    long now = android.os.SystemClock.uptimeMillis();
+                    boolean isDouble = (now - lastTapUpMs) <= DOUBLE_TAP_TIMEOUT_MS
+                            && dist2(x, y, lastTapX, lastTapY)
+                            < (touchSlop * 4f) * (touchSlop * 4f);
+                    if (isDouble) {
+                        // Cancel the pending single-tap from the first tap.
+                        removeCallbacks(singleTapRunnable);
+                        requestFocus();
+                        selectWordAt(offsetForPoint(x, y));
+                        dismissCompletions();
+                        lastTapUpMs = 0; // don't triple-tap into another select
+                        doubleTapHandled = true;
+                    } else {
+                        // Defer single-tap so a second tap can still cancel it.
+                        downX = x;
+                        downY = y;
+                        removeCallbacks(singleTapRunnable);
+                        postDelayed(singleTapRunnable, DOUBLE_TAP_TIMEOUT_MS);
+                        lastTapUpMs = now;
+                        lastTapX = x;
+                        lastTapY = y;
+                    }
+                }
+                return true;
+            }
+
+            case MotionEvent.ACTION_CANCEL: {
+                cancelPendingTaps();
+                activeHandle = Handle.NONE;
+                fingerSelecting = false;
+                gestureDetector.onTouchEvent(event);
+                return true;
+            }
+
+            default:
+                gestureDetector.onTouchEvent(event);
+                return true;
         }
-        return true;
+    }
+
+    private void cancelPendingTaps() {
+        removeCallbacks(longPressRunnable);
+        removeCallbacks(singleTapRunnable);
     }
 
     /** Marks the current touch sequence as multi-touch and cancels taps. */
@@ -1271,6 +1337,7 @@ public class CodeEditorView extends View
         scaling = true;
         scroller.forceFinished(true);
         dismissCompletions();
+        cancelPendingTaps();
         dispatchGestureCancel(event);
     }
 
@@ -1513,6 +1580,7 @@ public class CodeEditorView extends View
     protected void onDetachedFromWindow() {
         getViewTreeObserver().removeOnGlobalLayoutListener(imeLayoutListener);
         super.onDetachedFromWindow();
+        cancelPendingTaps();
         removeCallbacks(caretBlink);
         if (completionPopup != null) completionPopup.dismiss();
         if (highlighter != null) highlighter.shutdown();
@@ -1592,101 +1660,22 @@ public class CodeEditorView extends View
         }
     }
 
-    private final class GestureListener extends GestureDetector.SimpleOnGestureListener
-            implements GestureDetector.OnDoubleTapListener {
+    private final class GestureListener extends GestureDetector.SimpleOnGestureListener {
 
         @Override
         public boolean onDown(MotionEvent e) {
-            // A fresh single-finger DOWN always starts a clean sequence.
-            // (Multi-touch sessions never reach here — they cancel first.)
-            scroller.forceFinished(true);
+            // Required for onScroll / onFling to be delivered.
             return true;
-        }
-
-        /**
-         * Confirmed single tap (no double-tap followed). Using this instead of
-         * {@link #onSingleTapUp} is what makes double-tap word-select work:
-         * onSingleTapUp fires on the first tap of a double-tap and would move
-         * the caret, racing the subsequent onDoubleTap.
-         */
-        @Override
-        public boolean onSingleTapConfirmed(MotionEvent e) {
-            if (suppressSingleFingerGestures || scaling
-                    || activeHandle != Handle.NONE || longPressSelecting) {
-                return true;
-            }
-            requestFocus();
-            moveCaretTo(offsetForPoint(e.getX(), e.getY()), false);
-            dismissCompletions();
-            InputMethodManager imm = (InputMethodManager)
-                    getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
-            if (imm != null) {
-                imm.showSoftInput(CodeEditorView.this, 0);
-            }
-            return true;
-        }
-
-        @Override
-        public boolean onSingleTapUp(MotionEvent e) {
-            // Intentionally empty — wait for onSingleTapConfirmed so we don't
-            // steal the first half of a double-tap.
-            return true;
-        }
-
-        @Override
-        public boolean onDoubleTap(MotionEvent e) {
-            if (suppressSingleFingerGestures || scaling) {
-                return true;
-            }
-            requestFocus();
-            selectWordAt(offsetForPoint(e.getX(), e.getY()));
-            dismissCompletions();
-            // After double-tap, further MOVE of this finger extends the end.
-            longPressSelecting = true;
-            activeHandle = Handle.END;
-            downX = e.getX();
-            downY = e.getY();
-            touchMoved = false;
-            return true;
-        }
-
-        @Override
-        public boolean onDoubleTapEvent(MotionEvent e) {
-            // Second-tap MOVE/UP of a double-tap sequence: extend selection.
-            if (longPressSelecting && e.getActionMasked() == MotionEvent.ACTION_MOVE) {
-                dragSelectionTo(e.getX(), e.getY());
-                return true;
-            }
-            return true;
-        }
-
-        @Override
-        public void onLongPress(MotionEvent e) {
-            if (suppressSingleFingerGestures || scaling) {
-                return;
-            }
-            requestFocus();
-            selectWordAt(offsetForPoint(e.getX(), e.getY()));
-            dismissCompletions();
-            // Finger is still down — subsequent MOVE extends the selection end
-            // until UP (handled in onTouchEvent via longPressSelecting).
-            longPressSelecting = true;
-            activeHandle = Handle.END;
-            downX = e.getX();
-            downY = e.getY();
-            touchMoved = false;
         }
 
         @Override
         public boolean onScroll(MotionEvent e1, MotionEvent e2,
                                 float dx, float dy) {
             if (suppressSingleFingerGestures || scaling) return false;
-            // Handle / long-press selection drag is owned by onTouchEvent.
-            if (activeHandle != Handle.NONE || longPressSelecting) return false;
+            if (activeHandle != Handle.NONE || fingerSelecting) return false;
             int nx = Math.max(0, Math.min(getScrollX() + Math.round(dx), maxScrollX()));
             int ny = Math.max(0, Math.min(getScrollY() + Math.round(dy), maxScrollY()));
             scrollTo(nx, ny);
-            // Keep a showing popup glued to the caret while the user pans.
             if (completionPopup != null && completionPopup.isShowing()) {
                 dismissCompletions();
             }
@@ -1697,7 +1686,7 @@ public class CodeEditorView extends View
         public boolean onFling(MotionEvent e1, MotionEvent e2,
                                float vx, float vy) {
             if (suppressSingleFingerGestures || scaling) return false;
-            if (activeHandle != Handle.NONE || longPressSelecting) return false;
+            if (activeHandle != Handle.NONE || fingerSelecting) return false;
             scroller.fling(getScrollX(), getScrollY(),
                     Math.round(-vx), Math.round(-vy),
                     0, maxScrollX(), 0, maxScrollY());

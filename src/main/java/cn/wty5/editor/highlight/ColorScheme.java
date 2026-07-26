@@ -8,7 +8,7 @@ public class ColorScheme {
     public int background = 0xFF1E1E2E;
     public int foreground = 0xFFCDD6F4;
     public int caret = 0xFFF5E0DC;
-    public int selection = 0x403E68D8;
+    public int selection = 0x663E68D8; // ~40% opaque — clearly visible on dark bg
     /** Filled circle / teardrop used for selection drag handles. */
     public int selectionHandle = 0xFF89B4FA;
     public int currentLine = 0x14FFFFFF;
