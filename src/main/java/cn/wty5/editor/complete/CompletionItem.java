@@ -3,7 +3,7 @@ package cn.wty5.editor.complete;
 /** One completion suggestion. */
 public final class CompletionItem {
 
-    public enum Kind { KEYWORD, TYPE, IDENTIFIER, SNIPPET }
+    public enum Kind { KEYWORD, TYPE, IDENTIFIER, SNIPPET, METHOD, VARIABLE }
 
     public final Kind kind;
     /** Text shown in the list. */

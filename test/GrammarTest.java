@@ -52,6 +52,9 @@ public class GrammarTest {
         testCompletionFromGrammar();
         testGoCompletion();
         testPluginInstall();
+        testLspConfigFromGrammar();
+        testLspConfigTransports();
+        testLspWorkspacePlaceholders();
         System.out.println(failures == 0 ? "ALL PASS" : failures + " FAILURES");
         if (failures > 0) System.exit(1);
     }
@@ -367,5 +370,112 @@ public class GrammarTest {
         check(hasCompute, "plugin completion: compute from file");
 
         pm.unloadAll();
+    }
+
+    static void testLspConfigFromGrammar() throws Exception {
+        LanguageSpec go = GrammarLoader.load(new File("grammars/go.json"));
+        check(go.lsp != null, "go.json has lsp block");
+        checkEq(cn.wty5.editor.lsp.LspConfig.Transport.STDIO, go.lsp.transport,
+                "go lsp transport stdio");
+        check(!go.lsp.command.isEmpty(), "go lsp command present");
+        checkEq("gopls", go.lsp.command.get(0), "go lsp command[0]");
+        check(!go.lsp.enabled, "go lsp disabled by default in sample");
+        checkEq("go", go.lsp.languageId, "go lsp languageId");
+        checkEq("${workspaceFolder}", go.lsp.cwd, "go lsp cwd placeholder");
+
+        LanguageSpec java = GrammarLoader.load(new File("grammars/java.json"));
+        check(java.lsp != null, "java.json has lsp block");
+        checkEq("jdtls", java.lsp.command.get(0), "java lsp command");
+        check(!java.lsp.enabled, "java lsp disabled by default");
+
+        // resolveLspConfig returns the grammar block even when disabled
+        Languages.ensureBuiltins();
+        // Force re-register from file so the in-memory builtins pick up lsp.
+        LanguageRegistry.getInstance().register(go);
+        cn.wty5.editor.lsp.LspConfig resolved =
+                LanguageRegistry.getInstance().resolveLspConfig("go");
+        check(resolved != null, "resolveLspConfig finds go");
+        check(!resolved.isConfigured(),
+                "disabled lsp is not isConfigured()");
+    }
+
+    static void testLspConfigTransports() {
+        // stdio via command string
+        cn.wty5.editor.lsp.LspConfig stdio = cn.wty5.editor.lsp.LspConfig.fromJson(
+                MiniJson.parseObject("{\"command\":\"gopls serve\",\"cwd\":\"/tmp\"}"));
+        check(stdio != null, "stdio fromJson");
+        checkEq(cn.wty5.editor.lsp.LspConfig.Transport.STDIO, stdio.transport,
+                "default transport stdio");
+        checkEq(2, stdio.command.size(), "command split on whitespace");
+        check(stdio.isConfigured(), "stdio configured");
+
+        // tcp
+        cn.wty5.editor.lsp.LspConfig tcp = cn.wty5.editor.lsp.LspConfig.fromJson(
+                MiniJson.parseObject(
+                        "{\"transport\":\"tcp\",\"host\":\"10.0.0.1\",\"port\":2087}"));
+        checkEq(cn.wty5.editor.lsp.LspConfig.Transport.TCP, tcp.transport, "tcp type");
+        checkEq(2087, tcp.port, "tcp port");
+        check(tcp.isConfigured(), "tcp configured");
+
+        // tcp via url shorthand
+        cn.wty5.editor.lsp.LspConfig tcpUrl = cn.wty5.editor.lsp.LspConfig.fromJson(
+                MiniJson.parseObject("{\"url\":\"tcp://127.0.0.1:9999\"}"));
+        checkEq(cn.wty5.editor.lsp.LspConfig.Transport.TCP, tcpUrl.transport,
+                "tcp from url scheme");
+        checkEq(9999, tcpUrl.port, "tcp port from url");
+
+        // websocket
+        cn.wty5.editor.lsp.LspConfig ws = cn.wty5.editor.lsp.LspConfig.fromJson(
+                MiniJson.parseObject(
+                        "{\"type\":\"websocket\",\"url\":\"ws://127.0.0.1:2087/lsp\"}"));
+        checkEq(cn.wty5.editor.lsp.LspConfig.Transport.WEBSOCKET, ws.transport,
+                "ws type");
+        check(ws.isConfigured(), "ws configured");
+
+        // http + sse
+        cn.wty5.editor.lsp.LspConfig http = cn.wty5.editor.lsp.LspConfig.fromJson(
+                MiniJson.parseObject("{"
+                        + "\"transport\":\"http\","
+                        + "\"url\":\"http://127.0.0.1:3000/lsp\","
+                        + "\"sseUrl\":\"http://127.0.0.1:3000/events\""
+                        + "}"));
+        checkEq(cn.wty5.editor.lsp.LspConfig.Transport.HTTP, http.transport, "http");
+        checkEq("http://127.0.0.1:3000/events", http.sseUrl, "sse url");
+        check(http.isConfigured(), "http configured");
+
+        // http inferred from url
+        cn.wty5.editor.lsp.LspConfig httpInf = cn.wty5.editor.lsp.LspConfig.fromJson(
+                MiniJson.parseObject("{\"url\":\"https://lsp.example/rpc\"}"));
+        checkEq(cn.wty5.editor.lsp.LspConfig.Transport.HTTP, httpInf.transport,
+                "https infers http transport");
+
+        // explicit disable
+        checkEq(null, cn.wty5.editor.lsp.LspConfig.fromJson(Boolean.FALSE),
+                "false → null");
+        cn.wty5.editor.lsp.LspConfig off = cn.wty5.editor.lsp.LspConfig.fromJson(
+                MiniJson.parseObject("{\"enabled\":false,\"command\":[\"x\"]}"));
+        check(off != null && !off.enabled, "enabled:false kept");
+        check(!off.isConfigured(), "disabled not configured");
+    }
+
+    static void testLspWorkspacePlaceholders() {
+        cn.wty5.editor.lsp.LspConfig.LspWorkspace ws =
+                new cn.wty5.editor.lsp.LspConfig.LspWorkspace(
+                        "/home/u/proj", "/home/u/proj/main.go", "go");
+        cn.wty5.editor.lsp.LspConfig raw = cn.wty5.editor.lsp.LspConfig.builder()
+                .command("gopls", "serve")
+                .cwd("${workspaceFolder}")
+                .rootUri("${workspaceFolderUri}")
+                .url("ws://localhost/lsp?file=${fileBasename}&lang=${languageId}")
+                .build();
+        cn.wty5.editor.lsp.LspConfig r = raw.resolve(ws);
+        checkEq("/home/u/proj", r.cwd, "cwd expanded");
+        checkEq("file:///home/u/proj", r.rootUri, "rootUri expanded");
+        check(r.url.contains("file=main.go"), "fileBasename expanded");
+        check(r.url.contains("lang=go"), "languageId expanded");
+        checkEq("file:///home/u/proj/main.go",
+                cn.wty5.editor.lsp.LspConfig.LspWorkspace.toFileUri(
+                        "/home/u/proj/main.go"),
+                "toFileUri");
     }
 }

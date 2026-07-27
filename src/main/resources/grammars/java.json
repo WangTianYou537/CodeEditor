@@ -63,5 +63,13 @@
   "hexNumbers": true,
   "binNumbers": true,
   "underscoreInNumbers": true,
-  "numberSuffixes": "lLfFdD"
+  "numberSuffixes": "lLfFdD",
+  "lsp": {
+    "transport": "stdio",
+    "command": ["jdtls", "-data", "${workspaceFolder}/.jdtls-workspace"],
+    "cwd": "${workspaceFolder}",
+    "rootUri": "${workspaceFolderUri}",
+    "languageId": "java",
+    "enabled": false
+  }
 }

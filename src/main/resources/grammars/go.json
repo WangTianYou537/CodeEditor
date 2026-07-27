@@ -66,5 +66,13 @@
   "hexNumbers": true,
   "binNumbers": true,
   "underscoreInNumbers": true,
-  "numberSuffixes": ""
+  "numberSuffixes": "",
+  "lsp": {
+    "transport": "stdio",
+    "command": ["gopls", "serve"],
+    "cwd": "${workspaceFolder}",
+    "rootUri": "${workspaceFolderUri}",
+    "languageId": "go",
+    "enabled": false
+  }
 }

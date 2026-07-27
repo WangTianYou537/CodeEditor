@@ -263,6 +263,8 @@ public final class CompletionPopup {
                 case KEYWORD:    return "k";
                 case TYPE:       return "T";
                 case SNIPPET:    return "▸";
+                case METHOD:     return "m";
+                case VARIABLE:   return "v";
                 case IDENTIFIER:
                 default:         return "a";
             }

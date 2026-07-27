@@ -6,10 +6,11 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Minimal JSON parser covering the subset used by grammar files:
- * objects, arrays, strings (with standard escapes), numbers, booleans, null.
+ * Minimal JSON parser/serializer covering the subset used by grammar files
+ * and the LSP client: objects, arrays, strings (with standard escapes),
+ * numbers, booleans, null.
  *
- * Values are returned as {@link Map}/{@link List}/String/Number/Boolean/null.
+ * Values are {@link Map}/{@link List}/String/Number/Boolean/null.
  * No external dependency — keeps the core runnable on a plain JDK.
  */
 public final class MiniJson {
@@ -27,6 +28,92 @@ public final class MiniJson {
             throw new IllegalArgumentException("expected JSON object");
         }
         return (Map<String, Object>) v;
+    }
+
+    /** Serialise a JSON-compatible value tree to a compact string. */
+    public static String stringify(Object value) {
+        StringBuilder sb = new StringBuilder();
+        write(sb, value);
+        return sb.toString();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void write(StringBuilder sb, Object value) {
+        if (value == null) {
+            sb.append("null");
+        } else if (value instanceof String) {
+            writeString(sb, (String) value);
+        } else if (value instanceof Boolean) {
+            sb.append(((Boolean) value) ? "true" : "false");
+        } else if (value instanceof Number) {
+            // Avoid trailing .0 for integers stored as Double.
+            Number n = (Number) value;
+            if (value instanceof Double || value instanceof Float) {
+                double d = n.doubleValue();
+                if (Double.isFinite(d) && d == Math.rint(d)
+                        && d >= Long.MIN_VALUE && d <= Long.MAX_VALUE) {
+                    sb.append((long) d);
+                } else {
+                    sb.append(d);
+                }
+            } else {
+                sb.append(n.toString());
+            }
+        } else if (value instanceof Map) {
+            sb.append('{');
+            boolean first = true;
+            for (Map.Entry<?, ?> e : ((Map<?, ?>) value).entrySet()) {
+                if (!first) sb.append(',');
+                first = false;
+                writeString(sb, String.valueOf(e.getKey()));
+                sb.append(':');
+                write(sb, e.getValue());
+            }
+            sb.append('}');
+        } else if (value instanceof List) {
+            sb.append('[');
+            boolean first = true;
+            for (Object o : (List<?>) value) {
+                if (!first) sb.append(',');
+                first = false;
+                write(sb, o);
+            }
+            sb.append(']');
+        } else if (value instanceof Object[]) {
+            sb.append('[');
+            Object[] arr = (Object[]) value;
+            for (int i = 0; i < arr.length; i++) {
+                if (i > 0) sb.append(',');
+                write(sb, arr[i]);
+            }
+            sb.append(']');
+        } else {
+            // Fallback: string form (keeps callers from crashing on enums etc.).
+            writeString(sb, String.valueOf(value));
+        }
+    }
+
+    private static void writeString(StringBuilder sb, String s) {
+        sb.append('"');
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"':  sb.append("\\\""); break;
+                case '\\': sb.append("\\\\"); break;
+                case '\b': sb.append("\\b"); break;
+                case '\f': sb.append("\\f"); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                case '\t': sb.append("\\t"); break;
+                default:
+                    if (c < 0x20) {
+                        sb.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
+            }
+        }
+        sb.append('"');
     }
 
     private static final class Parser {

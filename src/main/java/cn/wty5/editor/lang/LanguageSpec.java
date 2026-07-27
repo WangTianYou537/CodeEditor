@@ -1,5 +1,7 @@
 package cn.wty5.editor.lang;
 
+import cn.wty5.editor.lsp.LspConfig;
+
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -7,9 +9,9 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * Declarative description of a programming language's lexical surface
- * and completion sources. Loaded from a grammar JSON file or supplied by
- * a {@link cn.wty5.editor.plugin.LanguagePlugin}.
+ * Declarative description of a programming language's lexical surface,
+ * completion sources, and optional language-server connection. Loaded from a
+ * grammar JSON file or supplied by a {@link cn.wty5.editor.plugin.LanguagePlugin}.
  *
  * Fields are public final so the grammar lexer can read them without
  * getters; construction always goes through {@link Builder}.
@@ -41,6 +43,13 @@ public final class LanguageSpec {
     public final boolean binNumbers;
     public final boolean underscoreInNumbers;
     public final String numberSuffixes;
+
+    /**
+     * Optional language-server connection described by the grammar / plugin.
+     * Null means "no LSP for this language" — the editor keeps using local
+     * grammar completions only.
+     */
+    public final LspConfig lsp;
 
     /** One completion snippet: trigger → insert text. */
     public static final class Snippet {
@@ -76,6 +85,7 @@ public final class LanguageSpec {
         this.binNumbers = b.binNumbers;
         this.underscoreInNumbers = b.underscoreInNumbers;
         this.numberSuffixes = b.numberSuffixes;
+        this.lsp = b.lsp;
     }
 
     public static final class Builder {
@@ -99,6 +109,7 @@ public final class LanguageSpec {
         private boolean binNumbers = true;
         private boolean underscoreInNumbers = true;
         private String numberSuffixes = "lLfFdDuU";
+        private LspConfig lsp;
 
         public Builder name(String v) { this.name = v; return this; }
         public Builder extension(String v) { this.extensions.add(v); return this; }
@@ -162,6 +173,7 @@ public final class LanguageSpec {
             return this;
         }
         public Builder numberSuffixes(String v) { this.numberSuffixes = v; return this; }
+        public Builder lsp(LspConfig v) { this.lsp = v; return this; }
 
         public LanguageSpec build() {
             if (name == null || name.isEmpty()) {

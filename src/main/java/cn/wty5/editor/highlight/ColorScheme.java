@@ -9,7 +9,7 @@ public class ColorScheme {
     public int foreground = 0xFFCDD6F4;
     public int caret = 0xFFF5E0DC;
     public int selection = 0x993E68D8; // ~60% opaque — clearly visible on dark bg
-    /** Filled circle / teardrop used for selection drag handles. */
+    /** Android-style teardrop used for selection drag handles. */
     public int selectionHandle = 0xFF89B4FA;
     public int currentLine = 0x14FFFFFF;
     public int gutterBackground = 0xFF181825;
@@ -19,6 +19,15 @@ public class ColorScheme {
     public int completionSelected = 0xFF45475A;
     public int completionText = 0xFFCDD6F4;
     public int completionDetail = 0xFF9399B2;
+
+    /** LSP diagnostic underline / gutter tick colours. */
+    public int diagnosticError = 0xFFF38BA8;
+    public int diagnosticWarning = 0xFFF9E2AF;
+    public int diagnosticInfo = 0xFF89B4FA;
+    public int diagnosticHint = 0xFF6C7086;
+
+    /** IME composing-region underline (English suggestions / CJK preedit). */
+    public int composingUnderline = 0xFF89B4FA;
 
     public int colorOf(TokenType type) {
         switch (type) {

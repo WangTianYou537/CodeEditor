@@ -30,9 +30,11 @@ cp -r "$ROOT/grammars" "$CORE_OUT/" 2>/dev/null || true
 
 echo "== tests =="
 javac --release 17 -cp "$CORE_OUT" -d "$CORE_OUT" \
-  "$ROOT/test/CoreTest.java" "$ROOT/test/GrammarTest.java"
+  "$ROOT/test/CoreTest.java" "$ROOT/test/GrammarTest.java" \
+  "$ROOT/test/LspTest.java"
 ( cd "$ROOT" && java -cp "$CORE_OUT" CoreTest )
 ( cd "$ROOT" && java -cp "$CORE_OUT" GrammarTest )
+( cd "$ROOT" && java -cp "$CORE_OUT" LspTest )
 
 echo "== full tree vs android.jar =="
 rm -rf "$OUT" && mkdir -p "$OUT"

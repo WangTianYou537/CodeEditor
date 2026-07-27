@@ -124,6 +124,22 @@ public final class LanguageRegistry {
     }
 
     /**
+     * Resolve the effective {@link cn.wty5.editor.lsp.LspConfig} for a language.
+     * Plugin override wins over the grammar's {@code "lsp"} block; returns
+     * null when neither side configures a server (or it is explicitly
+     * disabled).
+     */
+    public synchronized cn.wty5.editor.lsp.LspConfig resolveLspConfig(String name) {
+        Entry e = byName.get(normalize(name));
+        if (e == null) return null;
+        if (e.plugin != null) {
+            cn.wty5.editor.lsp.LspConfig fromPlugin = e.plugin.getLspConfig();
+            if (fromPlugin != null) return fromPlugin;
+        }
+        return e.spec == null ? null : e.spec.lsp;
+    }
+
+    /**
      * Builds a lexer for the named language. Prefers a plugin's custom
      * lexer when present; otherwise wraps the spec in a {@link GrammarLexer}.
      */

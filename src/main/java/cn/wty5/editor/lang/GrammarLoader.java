@@ -36,10 +36,28 @@ import java.util.Map;
  *   "hexNumbers": true,
  *   "binNumbers": true,
  *   "underscoreInNumbers": true,
- *   "numberSuffixes": "lLfFdD"
+ *   "numberSuffixes": "lLfFdD",
+ *   "lsp": {
+ *     "transport": "stdio" | "tcp" | "socket" | "http" | "websocket",
+ *     "command": ["gopls", "serve"],
+ *     "args": ["-rpc.trace"],
+ *     "env": {"GOPATH": "${workspaceFolder}"},
+ *     "cwd": "${workspaceFolder}",
+ *     "url": "ws://127.0.0.1:2087/lsp",
+ *     "host": "127.0.0.1",
+ *     "port": 2087,
+ *     "sseUrl": "http://127.0.0.1:2087/sse",
+ *     "languageId": "go",
+ *     "rootUri": "${workspaceFolderUri}",
+ *     "initializationOptions": {},
+ *     "connectTimeoutMs": 10000,
+ *     "enabled": true
+ *   }
  * }
  * </pre>
  * See {@code grammars/java.json} and {@code grammars/go.json} for real examples.
+ * Placeholders {@code ${workspaceFolder}}, {@code ${file}}, {@code ${fileUri}},
+ * {@code ${languageId}}, … are expanded when the editor connects.
  */
 public final class GrammarLoader {
 
@@ -134,6 +152,14 @@ public final class GrammarLoader {
         if (root.containsKey("numberSuffixes")) {
             String suf = str(root.get("numberSuffixes"));
             if (suf != null) b.numberSuffixes(suf);
+        }
+
+        // Optional language-server block. Absent / null / false → no LSP.
+        if (root.containsKey("lsp")) {
+            Object lspRaw = root.get("lsp");
+            if (lspRaw != null && !(lspRaw instanceof Boolean && !((Boolean) lspRaw))) {
+                b.lsp(cn.wty5.editor.lsp.LspConfig.fromJson(lspRaw));
+            }
         }
 
         return b.build();

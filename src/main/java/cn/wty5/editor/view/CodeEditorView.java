@@ -1,20 +1,27 @@
 package cn.wty5.editor.view;
 
 import android.content.Context;
+import android.content.res.TypedArray;
 import android.graphics.Canvas;
 import android.graphics.Paint;
-import android.graphics.Path;
 import android.graphics.Rect;
 import android.graphics.Typeface;
+import android.graphics.drawable.Drawable;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.InputType;
+import android.text.TextUtils;
 import android.util.AttributeSet;
-import android.view.GestureDetector;
 import android.view.HapticFeedbackConstants;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
+import android.view.VelocityTracker;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.ExtractedText;
+import android.view.inputmethod.ExtractedTextRequest;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.OverScroller;
@@ -31,10 +38,16 @@ import cn.wty5.editor.lang.LanguageSpec;
 import cn.wty5.editor.lang.Languages;
 import cn.wty5.editor.lang.Lexer;
 import cn.wty5.editor.lang.TokenType;
+import cn.wty5.editor.lsp.Diagnostic;
+import cn.wty5.editor.lsp.LspClient;
+import cn.wty5.editor.lsp.LspListener;
 import cn.wty5.editor.plugin.PluginManager;
 
 import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -49,7 +62,7 @@ import java.util.List;
  * wiring and the completion popup.
  */
 public class CodeEditorView extends View
-        implements Highlighter.Callback, CompletionEngine.Callback {
+        implements Highlighter.Callback, CompletionEngine.Callback, LspListener {
 
     private static final float MIN_TEXT_SIZE_SP = 8f;
     private static final float MAX_TEXT_SIZE_SP = 48f;
@@ -72,26 +85,57 @@ public class CodeEditorView extends View
     /** Which selection handle is being dragged, if any. */
     private enum Handle { NONE, START, END }
     private Handle activeHandle = Handle.NONE;
-    /** After a long-press / double-tap word select, MOVE extends the end. */
-    private boolean fingerSelecting;
-    /** Pixel slop from {@link ViewConfiguration} — pan vs tap. */
-    private int touchSlop;
-    private float downX, downY;
-    /** True once onScroll has classified this gesture as a pan. */
-    private boolean panning;
-    /** Set by onDoubleTap / onLongPress so onSingleTapConfirmed is ignored. */
-    private boolean doubleTapHandled;
 
-    // -- composing region for IME (simplified) ---------------------------
+    /** Explicit single-pointer interaction state; no GestureDetector latency. */
+    private enum TouchMode {
+        IDLE,
+        TAP_PENDING,
+        PANNING,
+        HANDLE_DRAG,
+        LONG_PRESS_LOCKED,
+        LONG_PRESS_EXTENDING,
+        DOUBLE_TAP_LOCKED,
+        DOUBLE_TAP_EXTENDING
+    }
+    private TouchMode touchMode = TouchMode.IDLE;
+    private int touchSlop;
+    private int doubleTapSlop;
+    private int minimumFlingVelocity;
+    private int maximumFlingVelocity;
+    private float downX, downY;
+    private float lastTouchX, lastTouchY;
+    private long lastTapUpTime;
+    private float lastTapX, lastTapY;
+    /** Android rejects double taps closer than this (framework value: 40 ms). */
+    private static final long DOUBLE_TAP_MIN_TIME_MS = 40L;
+    /** Caret/selection at this pointer sequence's DOWN, for pinch rollback. */
+    private int touchStartCaret;
+    private int touchStartSelectionAnchor;
+    private int initialSelectionStart;
+    private int initialSelectionEnd;
+    private VelocityTracker velocityTracker;
+    private final Runnable longPressRunnable = this::onManualLongPressTimeout;
+
+    // -- composing region for IME -----------------------------------------
     private int composingStart = -1;
     private int composingEnd = -1;
+    /** Last selection/composing reported to {@link InputMethodManager}. */
+    private int lastImmSelStart = -1;
+    private int lastImmSelEnd = -1;
+    private int lastImmCompStart = -1;
+    private int lastImmCompEnd = -1;
+    private long lastImmDocumentVersion = -1;
+    /** Token of the last ExtractedTextRequest that asked for continuous updates. */
+    private int extractedToken = 0;
+    private boolean extractedMonitor;
+    /** Nested IME batch-edit depth (keeps multi-step commits as one undo). */
+    private int imeBatchDepth;
 
     // -- metrics ---------------------------------------------------------
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint gutterPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint fillPaint = new Paint();
-    private final Paint handlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Path handlePath = new Path();
+    private final Paint diagnosticPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Rect visibleFrame = new Rect();
     private float density;
     private float textSizeSp = DEFAULT_TEXT_SIZE_SP;
@@ -105,11 +149,51 @@ public class CodeEditorView extends View
     /** Reused per-line buffers: no allocations in the visible-line draw loop. */
     private float[] columnXs = new float[128];
     private float[] glyphWidths = new float[128];
+    private char[] textChars = new char[128];
+
+    /**
+     * Native Android text-select handles resolved from the activity theme
+     * ({@code textSelectHandleLeft/Right}). Drawn directly — no custom path.
+     */
+    private Drawable handleLeftDrawable;
+    private Drawable handleRightDrawable;
+    private int handleIntrinsicW;
+    private int handleIntrinsicH;
+    /** Fallback body radius used only when theme drawables are unavailable. */
     private float handleRadius;
+
+    // -- LSP ---------------------------------------------------------------
+    private LspClient lspClient;
+    private String lspDocumentUri;
+    private String lspLanguageId = "plaintext";
+    private int lspDocumentVersion;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Runnable lspChangeDebounce = this::flushLspDidChange;
+    private static final long LSP_CHANGE_DEBOUNCE_MS = 250;
+    private List<Diagnostic> diagnostics = Collections.emptyList();
+    /** When true, {@link #setLanguage} auto-connects using the grammar/plugin lsp block. */
+    private boolean autoStartLsp = true;
+    /** Absolute filesystem path of the project root (for ${workspaceFolder}). */
+    private String lspWorkspaceFolder;
+    /** Absolute filesystem path of the open file (for ${file} / document URI). */
+    private String lspFilePath;
+    /** True when the current client was started from grammar/plugin config. */
+    private boolean lspOwnedByEditor;
+    private final Document.ContentListener lspSyncListener =
+            new Document.ContentListener() {
+                @Override
+                public void onInsert(Document doc, int offset, String text) {
+                    scheduleLspDidChange();
+                }
+
+                @Override
+                public void onDelete(Document doc, int offset, String text) {
+                    scheduleLspDidChange();
+                }
+            };
 
     // -- scrolling / zoom ------------------------------------------------
     private final OverScroller scroller;
-    private final GestureDetector gestureDetector;
     private final ScaleGestureDetector scaleDetector;
     /** True while a pinch is actively changing the scale factor. */
     private boolean scaling;
@@ -117,8 +201,7 @@ public class CodeEditorView extends View
      * True from the moment a 2nd pointer lands (or a scale begins) until
      * every finger has lifted. Blocks caret moves / taps / scrolls that
      * would otherwise fire from the leftover single-finger UP that ends a
-     * pinch — GestureDetector still remembers the original DOWN and would
-     * synthesise an {@code onSingleTapUp}.
+     * pinch — a delayed final single-finger UP must never become a tap.
      */
     private boolean suppressSingleFingerGestures;
     /**
@@ -188,7 +271,11 @@ public class CodeEditorView extends View
         setWillNotDraw(false);
 
         density = context.getResources().getDisplayMetrics().density;
-        touchSlop = ViewConfiguration.get(context).getScaledTouchSlop();
+        ViewConfiguration config = ViewConfiguration.get(context);
+        touchSlop = config.getScaledTouchSlop();
+        doubleTapSlop = config.getScaledDoubleTapSlop();
+        minimumFlingVelocity = config.getScaledMinimumFlingVelocity();
+        maximumFlingVelocity = config.getScaledMaximumFlingVelocity();
         textPaint.setTypeface(Typeface.MONOSPACE);
         textPaint.setSubpixelText(true);
         textPaint.setLinearText(true);
@@ -196,16 +283,16 @@ public class CodeEditorView extends View
         gutterPaint.setSubpixelText(true);
         // SOLID style for fills — avoids accidental stroke state leaks.
         fillPaint.setStyle(Paint.Style.FILL);
-        handlePaint.setStyle(Paint.Style.FILL);
-        handleRadius = 10f * density;
+        diagnosticPaint.setStyle(Paint.Style.STROKE);
+        diagnosticPaint.setStrokeWidth(Math.max(1.5f, 1.5f * density));
+        diagnosticPaint.setStrokeCap(Paint.Cap.ROUND);
+        // Fallback size if the theme has no handle drawables.
+        handleRadius = 11f * density;
+        loadHandleDrawables();
 
         applyTextSize(textSizeSp, false);
 
         scroller = new OverScroller(context);
-        GestureListener gestures = new GestureListener();
-        gestureDetector = new GestureDetector(context, gestures);
-        gestureDetector.setOnDoubleTapListener(gestures);
-        gestureDetector.setIsLongpressEnabled(true);
         scaleDetector = new ScaleGestureDetector(context, new ScaleListener());
         // Quick-scale (double-tap-swipe) is confusing in an editor; pinch only.
         scaleDetector.setQuickScaleEnabled(false);
@@ -222,6 +309,7 @@ public class CodeEditorView extends View
     public void setDocument(Document doc) {
         if (this.document != null) {
             this.document.removeContentListener(widthCacheListener);
+            this.document.removeContentListener(lspSyncListener);
         }
         if (highlighter != null) {
             highlighter.shutdown();
@@ -234,15 +322,24 @@ public class CodeEditorView extends View
         }
         this.document = doc;
         this.document.addContentListener(widthCacheListener);
+        this.document.addContentListener(lspSyncListener);
         resetLineWidthCache(doc.lineCount());
         this.undoManager = new UndoManager(doc);
         Lexer lexer = Languages.lexerFor(language == null ? "java" : language.name);
         this.highlighter = new Highlighter(doc, lexer, this);
         this.completionEngine = new CompletionEngine(doc, language, this);
+        wireLspExternalSource();
         this.completionPopup = new CompletionPopup(this, scheme);
         this.completionPopup.setListener(this::applyCompletion);
         this.caret = 0;
         this.selectionAnchor = -1;
+        this.diagnostics = Collections.emptyList();
+        // Re-open on the language server under the same URI if one is attached.
+        if (lspClient != null && lspClient.isReady() && lspDocumentUri != null) {
+            lspDocumentVersion = 1;
+            lspClient.didOpen(lspDocumentUri, lspLanguageId, doc.toString(),
+                    lspDocumentVersion);
+        }
         updateGutterWidth();
         invalidate();
     }
@@ -273,14 +370,349 @@ public class CodeEditorView extends View
 
     public void setLanguage(LanguageSpec spec) {
         this.language = spec;
+        this.lspLanguageId = resolveLanguageId(spec);
         if (highlighter != null) {
             highlighter.setLexer(Languages.lexerFor(spec.name));
         }
         if (completionEngine != null) {
             completionEngine.setLanguage(spec);
         }
+        // Re-announce under the new language id if an external LSP is live;
+        // otherwise try to auto-connect from the grammar / plugin config.
+        if (lspClient != null && lspClient.isReady()
+                && lspDocumentUri != null && document != null
+                && !lspOwnedByEditor) {
+            lspDocumentVersion++;
+            lspClient.didOpen(lspDocumentUri, lspLanguageId,
+                    document.toString(), lspDocumentVersion);
+        } else if (autoStartLsp) {
+            connectLspFromLanguage();
+        }
         dismissCompletions();
         invalidate();
+    }
+
+    // ------------------------------------------------------------------
+    // LSP
+    // ------------------------------------------------------------------
+
+    /**
+     * Project folder + open file used to expand {@code ${workspaceFolder}} /
+     * {@code ${file}} placeholders in grammar LSP configs and to build the
+     * document URI sent to the server. Either argument may be null.
+     */
+    public void setLspWorkspace(String workspaceFolder, String filePath) {
+        this.lspWorkspaceFolder = workspaceFolder;
+        this.lspFilePath = filePath;
+        if (filePath != null) {
+            this.lspDocumentUri = cn.wty5.editor.lsp.LspConfig.LspWorkspace
+                    .toFileUri(filePath);
+        }
+        if (autoStartLsp && language != null) {
+            connectLspFromLanguage();
+        }
+    }
+
+    public String getLspWorkspaceFolder() {
+        return lspWorkspaceFolder;
+    }
+
+    public String getLspFilePath() {
+        return lspFilePath;
+    }
+
+    /**
+     * When {@code true} (default), {@link #setLanguage} and
+     * {@link #setLspWorkspace} automatically start/stop the language server
+     * described by the active grammar's {@code "lsp"} block or the plugin's
+     * {@link cn.wty5.editor.plugin.LanguagePlugin#getLspConfig()}.
+     */
+    public void setAutoStartLsp(boolean enabled) {
+        this.autoStartLsp = enabled;
+    }
+
+    public boolean isAutoStartLsp() {
+        return autoStartLsp;
+    }
+
+    /**
+     * Resolve + connect the LSP configured for the current language. No-ops
+     * when the grammar/plugin has no (enabled) {@code lsp} block. Stops any
+     * previously auto-started client first.
+     *
+     * @return the live client, or null when nothing was configured
+     */
+    public LspClient connectLspFromLanguage() {
+        LanguageSpec spec = this.language;
+        if (spec == null) return null;
+        cn.wty5.editor.lsp.LspConfig cfg =
+                LanguageRegistry.getInstance().resolveLspConfig(spec.name);
+        if (cfg == null && spec.lsp != null) cfg = spec.lsp;
+        if (cfg == null || !cfg.enabled) {
+            // Language has no server — drop a previously auto-started one.
+            if (lspOwnedByEditor) stopLsp();
+            return lspClient;
+        }
+        try {
+            return startLsp(cfg);
+        } catch (IOException e) {
+            if (lspOwnedByEditor) stopLsp();
+            return null;
+        }
+    }
+
+    /**
+     * Start a language server from a declarative {@link cn.wty5.editor.lsp.LspConfig}
+     * (stdio / tcp / http / websocket). Placeholders are expanded against the
+     * current {@link #setLspWorkspace} paths.
+     */
+    public LspClient startLsp(cn.wty5.editor.lsp.LspConfig config) throws IOException {
+        if (config == null) throw new IllegalArgumentException("config required");
+        String langId = config.languageId != null ? config.languageId
+                : (language == null ? "plaintext" : language.name);
+        cn.wty5.editor.lsp.LspConfig.LspWorkspace ws =
+                new cn.wty5.editor.lsp.LspConfig.LspWorkspace(
+                        lspWorkspaceFolder, lspFilePath, langId);
+        cn.wty5.editor.lsp.LspConfig resolved = config.resolve(ws);
+        if (!resolved.isConfigured()) {
+            throw new IOException("LSP config incomplete after placeholder expansion: "
+                    + resolved);
+        }
+        String docUri = lspDocumentUri;
+        if (docUri == null && lspFilePath != null) {
+            docUri = cn.wty5.editor.lsp.LspConfig.LspWorkspace.toFileUri(lspFilePath);
+        }
+        if (docUri == null) {
+            // Synthetic URI so didOpen still works for untitled buffers.
+            docUri = "inmemory:///editor." + (language == null ? "txt" : language.name);
+        }
+        String root = resolved.rootUri;
+        if (root == null || root.isEmpty()) {
+            root = lspWorkspaceFolder != null
+                    ? cn.wty5.editor.lsp.LspConfig.LspWorkspace.toFileUri(lspWorkspaceFolder)
+                    : "file:///";
+            // Re-build with concrete rootUri so initialize sees it.
+            resolved = cn.wty5.editor.lsp.LspConfig.builder()
+                    .enabled(resolved.enabled)
+                    .transport(resolved.transport)
+                    .command(resolved.command)
+                    .env(resolved.env)
+                    .cwd(resolved.cwd)
+                    .url(resolved.url)
+                    .host(resolved.host)
+                    .port(resolved.port)
+                    .sseUrl(resolved.sseUrl)
+                    .languageId(resolved.languageId != null ? resolved.languageId : langId)
+                    .rootUri(root)
+                    .initializationOptions(resolved.initializationOptions)
+                    .connectTimeoutMs(resolved.connectTimeoutMs)
+                    .build();
+        }
+
+        // Replace any previous editor-owned client.
+        if (lspOwnedByEditor) {
+            stopLsp();
+        } else {
+            detachLsp();
+        }
+
+        LspClient client = new LspClient();
+        attachLsp(client, docUri,
+                resolved.languageId != null ? resolved.languageId : langId);
+        lspOwnedByEditor = true;
+        client.start(resolved);
+        return client;
+    }
+
+    /**
+     * Attach a language server. Completions from the server merge with the
+     * local grammar list; diagnostics are underlined in the text.
+     *
+     * @param client already-constructed client (not yet necessarily started)
+     * @param documentUri LSP document URI, e.g. {@code file:///…/Main.java}
+     * @param languageId  LSP language id ({@code "java"}, {@code "go"}, …)
+     */
+    public void attachLsp(LspClient client, String documentUri, String languageId) {
+        // Detach without stopping — caller owns the previous client unless we did.
+        boolean wasOwned = lspOwnedByEditor;
+        LspClient previous = lspClient;
+        detachLsp();
+        if (wasOwned && previous != null) {
+            try { previous.stop(); } catch (Exception ignored) {}
+        }
+        this.lspClient = client;
+        this.lspDocumentUri = documentUri;
+        this.lspLanguageId = languageId == null
+                ? (language == null ? "plaintext" : language.name)
+                : languageId;
+        this.lspOwnedByEditor = false;
+        if (client == null) return;
+        client.setUiScheduler(r -> {
+            if (Looper.myLooper() == Looper.getMainLooper()) r.run();
+            else mainHandler.post(r);
+        });
+        client.addListener(this);
+        wireLspExternalSource();
+        if (client.isReady() && document != null && documentUri != null) {
+            lspDocumentVersion = 1;
+            client.didOpen(documentUri, this.lspLanguageId,
+                    document.toString(), lspDocumentVersion);
+        }
+    }
+
+    /**
+     * Spawn {@code command} as a language server over stdio and attach it.
+     * Convenience wrapper around {@link LspClient#startProcess} +
+     * {@link #attachLsp}.
+     */
+    public LspClient startLsp(List<String> command, String rootUri,
+                              String documentUri, String languageId)
+            throws IOException {
+        cn.wty5.editor.lsp.LspConfig cfg = cn.wty5.editor.lsp.LspConfig.builder()
+                .transport(cn.wty5.editor.lsp.LspConfig.Transport.STDIO)
+                .command(command)
+                .rootUri(rootUri)
+                .languageId(languageId)
+                .build();
+        if (documentUri != null) this.lspDocumentUri = documentUri;
+        LspClient client = startLsp(cfg);
+        return client;
+    }
+
+    /** Detach (but do not stop) the current language server. */
+    public void detachLsp() {
+        mainHandler.removeCallbacks(lspChangeDebounce);
+        if (lspClient != null) {
+            lspClient.removeListener(this);
+            if (lspDocumentUri != null) {
+                try { lspClient.didClose(lspDocumentUri); } catch (Exception ignored) {}
+            }
+        }
+        if (completionEngine != null) {
+            completionEngine.setExternalSource(null);
+        }
+        lspClient = null;
+        lspOwnedByEditor = false;
+        diagnostics = Collections.emptyList();
+        invalidate();
+    }
+
+    /** Detach and stop an editor-owned client (from grammar/plugin config). */
+    public void stopLsp() {
+        mainHandler.removeCallbacks(lspChangeDebounce);
+        LspClient client = lspClient;
+        boolean owned = lspOwnedByEditor;
+        String uri = lspDocumentUri;
+        if (client != null) {
+            client.removeListener(this);
+            if (uri != null) {
+                try { client.didClose(uri); } catch (Exception ignored) {}
+            }
+            if (owned) {
+                try { client.stop(); } catch (Exception ignored) {}
+            }
+        }
+        if (completionEngine != null) {
+            completionEngine.setExternalSource(null);
+        }
+        lspClient = null;
+        lspOwnedByEditor = false;
+        diagnostics = Collections.emptyList();
+        invalidate();
+    }
+
+    public LspClient getLspClient() {
+        return lspClient;
+    }
+
+    public List<Diagnostic> getDiagnostics() {
+        return diagnostics;
+    }
+
+    private static String resolveLanguageId(LanguageSpec spec) {
+        if (spec == null) return "plaintext";
+        if (spec.lsp != null && spec.lsp.languageId != null
+                && !spec.lsp.languageId.isEmpty()) {
+            return spec.lsp.languageId;
+        }
+        return spec.name;
+    }
+
+    @Override
+    public void onLspReady() {
+        if (lspClient == null || document == null || lspDocumentUri == null) return;
+        lspDocumentVersion = 1;
+        lspClient.didOpen(lspDocumentUri, lspLanguageId,
+                document.toString(), lspDocumentVersion);
+    }
+
+    @Override
+    public void onLspClosed(String message) {
+        diagnostics = Collections.emptyList();
+        if (completionEngine != null) {
+            completionEngine.setExternalSource(null);
+        }
+        invalidate();
+    }
+
+    @Override
+    public void onDiagnostics(String uri, List<Diagnostic> list) {
+        if (lspDocumentUri != null && uri != null
+                && !uriEquals(lspDocumentUri, uri)) {
+            return;
+        }
+        diagnostics = list == null
+                ? Collections.emptyList()
+                : Collections.unmodifiableList(new ArrayList<>(list));
+        invalidate();
+    }
+
+    @Override
+    public void onLspCompletions(int requestId, List<CompletionItem> items) {
+        if (completionEngine != null) {
+            completionEngine.acceptExternal(requestId, items);
+        }
+    }
+
+    private void wireLspExternalSource() {
+        if (completionEngine == null) return;
+        if (lspClient == null) {
+            completionEngine.setExternalSource(null);
+            return;
+        }
+        completionEngine.setExternalSource((caretOffset, prefixStart, prefix) -> {
+            if (lspClient == null || !lspClient.isReady() || lspDocumentUri == null) {
+                return -1;
+            }
+            int line = document.lineOfOffset(caretOffset);
+            int character = caretOffset - document.lineStart(line);
+            return lspClient.requestCompletion(lspDocumentUri, line, character);
+        });
+    }
+
+    private void scheduleLspDidChange() {
+        if (lspClient == null || !lspClient.isReady() || lspDocumentUri == null) {
+            return;
+        }
+        mainHandler.removeCallbacks(lspChangeDebounce);
+        mainHandler.postDelayed(lspChangeDebounce, LSP_CHANGE_DEBOUNCE_MS);
+    }
+
+    private void flushLspDidChange() {
+        if (lspClient == null || !lspClient.isReady()
+                || lspDocumentUri == null || document == null) {
+            return;
+        }
+        lspDocumentVersion++;
+        lspClient.didChange(lspDocumentUri, document.toString(), lspDocumentVersion);
+    }
+
+    private static boolean uriEquals(String a, String b) {
+        if (a == null || b == null) return false;
+        if (a.equals(b)) return true;
+        // Servers sometimes normalise file:///path vs file://path.
+        return a.replace("file:///", "file://").equals(
+                b.replace("file:///", "file://"));
     }
 
     public LanguageSpec getLanguage() {
@@ -305,10 +737,12 @@ public class CodeEditorView extends View
         undoManager.clear();
         caret = 0;
         selectionAnchor = -1;
+        composingStart = composingEnd = -1;
         resetLineWidthCache(document.lineCount());
         highlighter.invalidateAll();
         updateGutterWidth();
         scrollTo(0, 0);
+        restartImeInput();
         invalidate();
     }
 
@@ -406,6 +840,12 @@ public class CodeEditorView extends View
 
     /** Inserts at the caret, replacing any active selection. */
     public void insertAtCaret(String text) {
+        if (text == null || text.isEmpty()) return;
+        // Single closing brace on an otherwise-blank indented line → outdent
+        // to the matching opener before inserting, so `}` lands at the right level.
+        if ("}".equals(text) && !hasSelection()) {
+            maybeOutdentBeforeClosingBrace();
+        }
         deleteSelectionIfAny();
         document.insert(caret, text);
         caret += text.length();
@@ -419,6 +859,59 @@ public class CodeEditorView extends View
         }
     }
 
+    /**
+     * Insert a newline and the appropriate leading whitespace for the new
+     * line. Also handles the empty-block case: caret between {@code {|} }
+     * expands to a fully indented inner line with the closer re-indented.
+     */
+    public void insertNewlineWithIndent() {
+        deleteSelectionIfAny();
+        String indent = leadingWhitespaceOfLine(document.lineOfOffset(caret));
+        String unit = indentUnit();
+
+        // Look at the non-ws char immediately before the caret (on this line).
+        int line = document.lineOfOffset(caret);
+        int lineStart = document.lineStart(line);
+        int before = caret - 1;
+        while (before >= lineStart
+                && isIndentWs(document.charAt(before))) {
+            before--;
+        }
+        char open = before >= lineStart ? document.charAt(before) : '\0';
+        boolean increase = open == '{' || open == '(' || open == '[';
+
+        // Empty-block split: `{|}` → `{\n<indent+>\n<indent>}` with caret middle.
+        boolean splitBlock = false;
+        if (increase && caret < document.length()) {
+            int after = caret;
+            while (after < document.lineEnd(line)
+                    && isIndentWs(document.charAt(after))) {
+                after++;
+            }
+            if (after < document.length()) {
+                char closer = document.charAt(after);
+                splitBlock = (open == '{' && closer == '}')
+                        || (open == '(' && closer == ')')
+                        || (open == '[' && closer == ']');
+            }
+        }
+
+        if (splitBlock) {
+            String inner = indent + unit;
+            String insert = "\n" + inner + "\n" + indent;
+            document.insert(caret, insert);
+            // Caret sits on the inner blank line, after its indent.
+            caret = caret + 1 + inner.length();
+        } else {
+            String next = indent + (increase ? unit : "");
+            String insert = "\n" + next;
+            document.insert(caret, insert);
+            caret += insert.length();
+        }
+        afterEdit();
+        dismissCompletions();
+    }
+
     public void deleteBackward() {
         if (deleteSelectionIfAny()) {
             afterEdit();
@@ -426,8 +919,9 @@ public class CodeEditorView extends View
             return;
         }
         if (caret > 0) {
-            document.delete(caret - 1, caret);
-            caret--;
+            int start = prevClusterOffset(caret);
+            document.delete(start, caret);
+            caret = start;
             afterEdit();
             // Backspace updates the prefix if a popup is already up; otherwise
             // don't spontaneously open one (avoids covering the IME mid-delete).
@@ -444,7 +938,8 @@ public class CodeEditorView extends View
             return;
         }
         if (caret < document.length()) {
-            document.delete(caret, caret + 1);
+            int end = nextClusterOffset(caret);
+            document.delete(caret, end);
             afterEdit();
             if (completionPopup != null && completionPopup.isShowing()) {
                 requestCompletionsAtCaret();
@@ -473,18 +968,33 @@ public class CodeEditorView extends View
     }
 
     private void afterEdit() {
-        composingStart = composingEnd = -1;
+        // Non-IME edits (hardware keys, paste via our own API, undo) clear any
+        // stale composing region so the IME cannot keep extending it.
+        if (imeBatchDepth == 0) {
+            composingStart = composingEnd = -1;
+        }
         clampCaret();
         updateGutterWidth();
         ensureCaretVisible();
         resetCaretBlink();
+        notifyImeSelection();
         invalidate();
     }
 
     private void clampCaret() {
-        caret = Math.max(0, Math.min(caret, document.length()));
+        caret = normalizeCaretOffset(caret);
         if (selectionAnchor > document.length()) {
             selectionAnchor = -1;
+        } else if (selectionAnchor >= 0) {
+            selectionAnchor = normalizeCaretOffset(selectionAnchor);
+        }
+        if (composingStart >= 0) {
+            int len = document.length();
+            composingStart = Math.max(0, Math.min(composingStart, len));
+            composingEnd = Math.max(composingStart, Math.min(composingEnd, len));
+            if (composingStart == composingEnd) {
+                composingStart = composingEnd = -1;
+            }
         }
     }
 
@@ -497,7 +1007,7 @@ public class CodeEditorView extends View
     }
 
     public void moveCaretTo(int offset, boolean extendSelection) {
-        offset = Math.max(0, Math.min(offset, document.length()));
+        offset = normalizeCaretOffset(offset);
         if (extendSelection) {
             if (selectionAnchor < 0) {
                 selectionAnchor = caret;
@@ -507,10 +1017,14 @@ public class CodeEditorView extends View
         }
         caret = offset;
         activeHandle = Handle.NONE;
-        fingerSelecting = false;
         undoManager.sealCurrent(); // caret jump ends the typing merge run
+        // Moving the caret aborts an in-progress composition (matches EditText).
+        if (composingStart >= 0 && imeBatchDepth == 0) {
+            composingStart = composingEnd = -1;
+        }
         ensureCaretVisible();
         resetCaretBlink();
+        notifyImeSelection();
         invalidate();
     }
 
@@ -523,8 +1037,9 @@ public class CodeEditorView extends View
 
     /**
      * Selects the word (identifier run) under {@code offset}. Falls back to a
-     * single character when the touch is on whitespace/punctuation. Always
-     * leaves {@link #hasSelection()} true so the handles appear.
+     * single shaped cluster when the touch is on whitespace/punctuation. Always
+     * leaves {@link #hasSelection()} true so the handles appear. Never leaves
+     * the caret or anchor inside a surrogate / combining / ligature cluster.
      */
     private void selectWordAt(int offset) {
         if (document == null || document.length() == 0) {
@@ -536,44 +1051,102 @@ public class CodeEditorView extends View
         offset = Math.max(0, Math.min(offset, document.length()));
         int probe = offset < document.length() ? offset
                 : Math.max(0, offset - 1);
+        // Land on the cluster start so supplementary-plane probes never leave
+        // a lone high surrogate selected.
+        probe = clusterStartAtOrBefore(probe);
         char pc = document.charAt(probe);
         int s;
         int e;
         if (isWordChar(pc)) {
             s = probe;
-            e = probe + 1;
+            e = expandOffsetToClusterEnd(probe + 1);
             while (s > 0 && isWordChar(document.charAt(s - 1))) s--;
-            while (e < document.length() && isWordChar(document.charAt(e))) e++;
+            s = clusterStartAtOrBefore(s);
+            while (e < document.length() && isWordChar(document.charAt(e))) {
+                e = expandOffsetToClusterEnd(e + 1);
+            }
         } else if (Character.isWhitespace(pc)) {
             s = probe;
-            e = probe + 1;
+            e = expandOffsetToClusterEnd(probe + 1);
             while (s > 0 && Character.isWhitespace(document.charAt(s - 1))) s--;
+            s = clusterStartAtOrBefore(s);
             while (e < document.length()
-                    && Character.isWhitespace(document.charAt(e))) e++;
-            // A pure-whitespace "word" is rarely useful — take one char.
+                    && Character.isWhitespace(document.charAt(e))) {
+                e = expandOffsetToClusterEnd(e + 1);
+            }
+            // A pure-whitespace "word" is rarely useful — take one cluster.
             if (e - s > 1) {
                 s = probe;
-                e = probe + 1;
+                e = expandOffsetToClusterEnd(probe + 1);
             }
         } else {
             s = probe;
-            e = probe + 1;
+            e = expandOffsetToClusterEnd(probe + 1);
         }
         if (s == e) {
             // Absolute last resort so hasSelection() is true and handles show.
-            e = Math.min(document.length(), s + 1);
-            if (s == e && s > 0) s--;
+            e = expandOffsetToClusterEnd(Math.min(document.length(), s + 1));
+            if (s == e && s > 0) {
+                s = prevClusterOffset(s);
+            }
         }
         selectionAnchor = s;
         caret = e;
         activeHandle = Handle.NONE;
+        composingStart = composingEnd = -1;
         ensureCaretVisible();
         resetCaretBlink();
-        // Haptic may be disabled on some devices / emulators — never fatal.
+        notifyImeSelection();
+        invalidate();
+    }
+
+    /**
+     * Selects a complete word and records immutable initial bounds. A long
+     * press stays locked to these bounds until the finger moves beyond slop
+     * and outside the word; small touch jitter can never shrink "public" to
+     * "pub".
+     */
+    private void activateWordSelectionAt(float viewX, float viewY,
+                                         boolean fromDoubleTap) {
+        requestFocus();
+        selectWordAt(characterOffsetForPoint(viewX, viewY));
+        initialSelectionStart = selectionStart();
+        initialSelectionEnd = selectionEnd();
+        dismissCompletions();
         try {
             performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
         } catch (Exception ignored) {
         }
+        if (getParent() != null) {
+            getParent().requestDisallowInterceptTouchEvent(true);
+        }
+        touchMode = fromDoubleTap
+                ? TouchMode.DOUBLE_TAP_LOCKED
+                : TouchMode.LONG_PRESS_LOCKED;
+    }
+
+    /** Expands from the initial whole-word selection without shrinking it. */
+    private void extendInitialWordSelection(float viewX, float viewY) {
+        int offset = offsetForPoint(viewX, viewY); // already cluster-snapped
+        if (offset < initialSelectionStart) {
+            selectionAnchor = initialSelectionEnd;
+            caret = offset;
+            activeHandle = Handle.START;
+        } else if (offset > initialSelectionEnd) {
+            selectionAnchor = initialSelectionStart;
+            caret = offset;
+            activeHandle = Handle.END;
+        } else {
+            // Still inside the initially selected word: preserve it exactly.
+            selectionAnchor = initialSelectionStart;
+            caret = initialSelectionEnd;
+            activeHandle = Handle.NONE;
+        }
+        caret = normalizeCaretOffset(caret);
+        selectionAnchor = normalizeCaretOffset(selectionAnchor);
+        ensureCaretVisible();
+        resetCaretBlink();
+        notifyImeSelection();
         invalidate();
     }
 
@@ -602,7 +1175,8 @@ public class CodeEditorView extends View
                 || lineHeight <= 0f || charWidth <= 0f) {
             return Handle.NONE;
         }
-        float hitR = handleRadius * 2.4f;
+        // Body is offset from the tip; give a generous hit target.
+        float hitR = handleRadius * 2.8f;
         float hitR2 = hitR * hitR;
         float[] start = handleViewPos(selectionStart(), true);
         float[] end = handleViewPos(selectionEnd(), false);
@@ -614,14 +1188,22 @@ public class CodeEditorView extends View
         return Handle.NONE;
     }
 
-    /** View-local (x, y) of the handle circle centre for a document offset. */
+    /**
+     * View-local centre of the handle body for hit-testing. Native left/right
+     * drawables hang BELOW the line; the tip sits on the selection edge and
+     * the body is centred in the drawable bounds.
+     */
     private float[] handleViewPos(int offset, boolean startHandle) {
         int line = document.lineOfOffset(offset);
-        float x = contentXForOffset(offset) - getScrollX();
-        float y = startHandle
-                ? line * lineHeight - getScrollY() - handleRadius * 0.55f
-                : (line + 1) * lineHeight - getScrollY() + handleRadius * 0.55f;
-        return new float[]{x, y};
+        float tipX = contentXForOffset(offset) - getScrollX();
+        float tipY = (line + 1) * lineHeight - getScrollY();
+        float w = handleIntrinsicW > 0 ? handleIntrinsicW : handleRadius * 2f;
+        float h = handleIntrinsicH > 0 ? handleIntrinsicH : handleRadius * 2f;
+        // Left handle: tip is the top-RIGHT of the bitmap.
+        // Right handle: tip is the top-LEFT of the bitmap.
+        float left = startHandle ? tipX - w : tipX;
+        float top = tipY;
+        return new float[]{left + w * 0.5f, top + h * 0.5f};
     }
 
     private static float dist2(float x1, float y1, float x2, float y2) {
@@ -637,21 +1219,21 @@ public class CodeEditorView extends View
      */
     private void dragSelectionTo(float viewX, float viewY) {
         if (document == null) return;
+        // offsetForPoint already snaps to a cluster boundary.
         int offset = offsetForPoint(viewX, viewY);
-        offset = Math.max(0, Math.min(offset, document.length()));
 
         if (activeHandle == Handle.START) {
             int end = Math.max(caret, selectionAnchor);
             if (offset >= end) {
-                // Crossed the end — pin start at end-1 and flip to END drag.
-                selectionAnchor = Math.max(0, end - 1);
+                // Crossed the end — pin start at the previous cluster and flip.
+                selectionAnchor = prevClusterOffset(end);
                 caret = offset;
                 activeHandle = Handle.END;
             } else {
                 selectionAnchor = offset;
                 caret = end;
             }
-        } else { // END or fingerSelecting without an explicit handle
+        } else { // END handle drag
             int start = selectionAnchor >= 0
                     ? Math.min(caret, selectionAnchor)
                     : caret;
@@ -669,10 +1251,11 @@ public class CodeEditorView extends View
                 activeHandle = Handle.END;
             }
         }
-        caret = Math.max(0, Math.min(caret, document.length()));
-        selectionAnchor = Math.max(0, Math.min(selectionAnchor, document.length()));
+        caret = normalizeCaretOffset(caret);
+        selectionAnchor = normalizeCaretOffset(selectionAnchor);
         ensureCaretVisible();
         resetCaretBlink();
+        notifyImeSelection();
         invalidate();
     }
 
@@ -681,23 +1264,55 @@ public class CodeEditorView extends View
     // IME plumbing (called by EditorInputConnection)
     // ------------------------------------------------------------------
 
-    void commitTextFromIme(String text) {
+    /**
+     * Commit text from the IME. {@code newCursorPosition} follows the
+     * InputConnection contract: &gt;0 = chars after the inserted text,
+     * &lt;0 = chars before it, 0/1 = end of insert (the common case).
+     */
+    void commitTextFromIme(String text, int newCursorPosition) {
+        if (text == null) text = "";
+        // Soft keyboards often deliver Enter as a bare "\n" commit rather than
+        // a KEYCODE_ENTER event — route those through the indent-aware path.
+        if (composingStart < 0 && isOnlyNewlines(text)) {
+            for (int i = 0; i < text.length(); i++) {
+                if (text.charAt(i) == '\n') insertNewlineWithIndent();
+            }
+            notifyImeSelection();
+            return;
+        }
+        int insertAt;
         if (composingStart >= 0) {
             document.replace(composingStart, composingEnd, text);
-            caret = composingStart + text.length();
+            insertAt = composingStart;
             composingStart = composingEnd = -1;
-            afterEdit();
-            if (shouldAutoCompleteAfter(text)) {
-                requestCompletionsAtCaret();
-            } else {
-                dismissCompletions();
-            }
         } else {
-            insertAtCaret(text);
+            deleteSelectionIfAny();
+            insertAt = caret;
+            if (text.indexOf('\n') >= 0) {
+                // Multi-line: indent-aware path places the caret itself.
+                insertMultilineIndented(text);
+                notifyImeSelection();
+                return;
+            }
+            document.insert(caret, text);
+        }
+        caret = insertAt + text.length();
+        applyImeCursorPosition(insertAt, text.length(), newCursorPosition);
+        afterEdit();
+        if (shouldAutoCompleteAfter(text)) {
+            requestCompletionsAtCaret();
+        } else {
+            dismissCompletions();
         }
     }
 
-    void replaceComposingFromIme(String text) {
+    /** Back-compat for call sites that don't care about the cursor arg. */
+    void commitTextFromIme(String text) {
+        commitTextFromIme(text, 1);
+    }
+
+    void replaceComposingFromIme(String text, int newCursorPosition) {
+        if (text == null) text = "";
         if (composingStart < 0) {
             deleteSelectionIfAny();
             composingStart = caret;
@@ -706,41 +1321,435 @@ public class CodeEditorView extends View
         document.replace(composingStart, composingEnd, text);
         composingEnd = composingStart + text.length();
         caret = composingEnd;
+        applyImeCursorPosition(composingStart, text.length(), newCursorPosition);
+        // Keep composing alive across intermediate updates — do NOT go through
+        // afterEdit() which would clear it. Still notify the IME so suggestion
+        // engines see the growing preedit.
         clampCaret();
         ensureCaretVisible();
+        resetCaretBlink();
+        notifyImeSelection();
         invalidate();
-        // Composing updates are intermediate — don't pop the completion list
-        // over the IME candidate bar on every keystroke of a CJK session.
+        // Don't pop the completion list over the IME candidate bar mid-compose.
+        dismissCompletions();
+    }
+
+    void replaceComposingFromIme(String text) {
+        replaceComposingFromIme(text, 1);
+    }
+
+    void setComposingRegionFromIme(int start, int end) {
+        if (document == null) return;
+        int len = document.length();
+        start = Math.max(0, Math.min(start, len));
+        end = Math.max(0, Math.min(end, len));
+        if (start > end) {
+            int t = start; start = end; end = t;
+        }
+        if (start == end) {
+            composingStart = composingEnd = -1;
+        } else {
+            composingStart = start;
+            composingEnd = end;
+        }
+        notifyImeSelection();
+        invalidate();
     }
 
     void finishComposingFromIme() {
+        if (composingStart < 0) return;
         composingStart = composingEnd = -1;
+        notifyImeSelection();
+        invalidate();
+    }
+
+    /** IME key-event backspace; unlike hardware delete it preserves preedit. */
+    void deleteBackwardFromIme() {
+        if (hasSelection()) {
+            int s = selectionStart();
+            int e = selectionEnd();
+            document.delete(s, e);
+            transformComposingAfterReplace(s, e, 0);
+            caret = s;
+            selectionAnchor = -1;
+            afterImeMutationPreservingComposition();
+            return;
+        }
+        if (caret <= 0) return;
+        int start = prevClusterOffset(caret);
+        int oldCaret = caret;
+        document.delete(start, oldCaret);
+        transformComposingAfterReplace(start, oldCaret, 0);
+        caret = start;
+        afterImeMutationPreservingComposition();
+    }
+
+    /** IME key-event forward delete; preserves preedit while deleting within it. */
+    void deleteForwardFromIme() {
+        if (hasSelection()) {
+            int s = selectionStart();
+            int e = selectionEnd();
+            document.delete(s, e);
+            transformComposingAfterReplace(s, e, 0);
+            caret = s;
+            selectionAnchor = -1;
+            afterImeMutationPreservingComposition();
+            return;
+        }
+        if (caret >= document.length()) return;
+        int end = nextClusterOffset(caret);
+        document.delete(caret, end);
+        transformComposingAfterReplace(caret, end, 0);
+        afterImeMutationPreservingComposition();
+    }
+
+    private void afterImeMutationPreservingComposition() {
+        clampCaret();
+        updateGutterWidth();
+        ensureCaretVisible();
+        resetCaretBlink();
+        notifyImeSelection();
+        invalidate();
+        dismissCompletions();
     }
 
     void deleteSurroundingFromIme(int before, int after) {
+        before = Math.max(0, before);
+        after = Math.max(0, after);
+        // A no-op is genuinely a no-op. Some IMEs probe with (0,0); ending
+        // composition here made the candidate strip disappear.
+        if (before == 0 && after == 0) {
+            notifyImeSelection();
+            return;
+        }
+
+        if (hasSelection()) {
+            // InputConnection defines "before" relative to selectionStart and
+            // "after" relative to selectionEnd. The selected text itself must
+            // remain untouched. Delete the right range first so left offsets
+            // stay stable, then shift the preserved selection by leftRemoved.
+            int selStart = selectionStart();
+            int selEnd = selectionEnd();
+            boolean forward = selectionAnchor <= caret;
+            int leftStart = Math.max(0, selStart - before);
+            int rightEnd = Math.min(document.length(), selEnd + after);
+            leftStart = snapRangeStartToCluster(leftStart);
+            rightEnd = expandOffsetToClusterEnd(rightEnd);
+
+            int rightRemoved = Math.max(0, rightEnd - selEnd);
+            if (rightRemoved > 0) {
+                document.delete(selEnd, rightEnd);
+                transformComposingAfterReplace(selEnd, rightEnd, 0);
+            }
+            int leftRemoved = Math.max(0, selStart - leftStart);
+            if (leftRemoved > 0) {
+                document.delete(leftStart, selStart);
+                transformComposingAfterReplace(leftStart, selStart, 0);
+            }
+
+            int newStart = selStart - leftRemoved;
+            int newEnd = selEnd - leftRemoved;
+            if (forward) {
+                selectionAnchor = newStart;
+                caret = newEnd;
+            } else {
+                selectionAnchor = newEnd;
+                caret = newStart;
+            }
+            afterImeMutationPreservingComposition();
+            return;
+        }
+
         int s = Math.max(0, caret - before);
         int e = Math.min(document.length(), caret + after);
-        if (e > caret) {
-            document.delete(caret, e);
+        // IME counts UTF-16 units; expand both edges out to shaped cluster
+        // boundaries so deletion never splits a surrogate/combining sequence.
+        s = snapRangeStartToCluster(s);
+        e = expandOffsetToClusterEnd(e);
+        if (s == e) {
+            notifyImeSelection();
+            return;
         }
-        if (caret > s) {
-            document.delete(s, caret);
-            caret = s;
+        document.delete(s, e);
+        transformComposingAfterReplace(s, e, 0);
+        caret = s;
+        selectionAnchor = -1;
+        afterImeMutationPreservingComposition();
+    }
+
+    /**
+     * Android 14+ InputConnection.replaceText: replace absolute document range
+     * and finish composition per the platform contract.
+     */
+    void replaceRangeFromIme(int start, int end, String text,
+                             int newCursorPosition) {
+        if (document == null) return;
+        if (text == null) text = "";
+        int len = document.length();
+        start = Math.max(0, Math.min(start, len));
+        end = Math.max(0, Math.min(end, len));
+        if (start > end) {
+            int t = start; start = end; end = t;
         }
-        afterEdit();
-        if (completionPopup != null && completionPopup.isShowing()) {
-            requestCompletionsAtCaret();
+        document.replace(start, end, text);
+        // replaceText explicitly finishes composing text.
+        composingStart = composingEnd = -1;
+        applyImeCursorPosition(start, text.length(), newCursorPosition);
+        afterImeMutationPreservingComposition();
+    }
+
+    /**
+     * Transform composing [start,end) through one document replacement
+     * [replaceStart,replaceEnd) → insertedLength. Text before composition
+     * shifts it; text inside composition shrinks/grows it; disjoint text after
+     * it leaves the range untouched. Partial cross-boundary replacements end
+     * composition because the IME no longer has an unambiguous preedit range.
+     */
+    private void transformComposingAfterReplace(int replaceStart, int replaceEnd,
+                                                int insertedLength) {
+        if (composingStart < 0) return;
+        int oldStart = composingStart;
+        int oldEnd = composingEnd;
+        int removed = Math.max(0, replaceEnd - replaceStart);
+        int delta = insertedLength - removed;
+
+        if (replaceEnd <= oldStart) {
+            // Edit entirely before composition.
+            composingStart = oldStart + delta;
+            composingEnd = oldEnd + delta;
+        } else if (replaceStart >= oldEnd) {
+            // Edit entirely after composition: unchanged.
+        } else if (replaceStart >= oldStart && replaceEnd <= oldEnd) {
+            // Edit wholly inside composition.
+            composingEnd = oldEnd + delta;
+            if (composingEnd <= composingStart) {
+                composingStart = composingEnd = -1;
+            }
+        } else {
+            // Crosses exactly one boundary — safest to finish composition.
+            composingStart = composingEnd = -1;
+        }
+    }
+
+    void deleteSurroundingCodePointsFromIme(int beforeCp, int afterCp) {
+        if (document == null) return;
+        beforeCp = Math.max(0, beforeCp);
+        afterCp = Math.max(0, afterCp);
+        // Counts are relative to the selection boundaries, not always `caret`.
+        int beforeEdge = hasSelection() ? selectionStart() : caret;
+        int afterEdge = hasSelection() ? selectionEnd() : caret;
+        int before = utf16UnitsBefore(beforeEdge, beforeCp);
+        int after = utf16UnitsAfter(afterEdge, afterCp);
+        deleteSurroundingFromIme(before, after);
+    }
+
+    private int utf16UnitsBefore(int offset, int codePointCount) {
+        int units = 0;
+        int i = Math.max(0, Math.min(offset, document.length()));
+        for (int n = 0; n < codePointCount && i > 0; n++) {
+            int cp = Character.codePointBefore(document, i);
+            int width = Character.charCount(cp);
+            i -= width;
+            units += width;
+        }
+        return units;
+    }
+
+    private int utf16UnitsAfter(int offset, int codePointCount) {
+        int units = 0;
+        int i = Math.max(0, Math.min(offset, document.length()));
+        int len = document.length();
+        for (int n = 0; n < codePointCount && i < len; n++) {
+            int cp = Character.codePointAt(document, i);
+            int width = Character.charCount(cp);
+            i += width;
+            units += width;
+        }
+        return units;
+    }
+
+    void setSelectionFromIme(int start, int end) {
+        if (document == null) return;
+        int len = document.length();
+        start = Math.max(0, Math.min(start, len));
+        end = Math.max(0, Math.min(end, len));
+        if (start == end) {
+            selectionAnchor = -1;
+            caret = start;
+        } else {
+            selectionAnchor = start;
+            caret = end;
+        }
+        // BaseInputConnection.setSelection does NOT remove composing spans.
+        // English IMEs commonly re-assert the cursor after a backspace; ending
+        // composition here erased their candidate strip. Only drop composition
+        // when the requested selection is completely outside the preedit.
+        if (composingStart >= 0) {
+            int low = Math.min(start, end);
+            int high = Math.max(start, end);
+            boolean caretInside = start == end
+                    && start >= composingStart && start <= composingEnd;
+            boolean selectionInside = start != end
+                    && low >= composingStart && high <= composingEnd;
+            if (!caretInside && !selectionInside) {
+                composingStart = composingEnd = -1;
+            }
+        }
+        undoManager.sealCurrent();
+        ensureCaretVisible();
+        resetCaretBlink();
+        notifyImeSelection();
+        invalidate();
+    }
+
+    void beginImeBatch() {
+        if (imeBatchDepth++ == 0 && undoManager != null) {
+            undoManager.beginBatch();
+        }
+    }
+
+    void endImeBatch() {
+        if (imeBatchDepth <= 0) return;
+        if (--imeBatchDepth == 0 && undoManager != null) {
+            undoManager.endBatch();
+            // End of a multi-step IME gesture: make sure selection is published.
+            notifyImeSelection();
         }
     }
 
     CharSequence textBeforeCursor(int length) {
-        int s = Math.max(0, caret - length);
-        return document.substring(s, caret);
+        if (document == null || length <= 0) return "";
+        // InputConnection cursor is the start of selection for "before".
+        int cursor = hasSelection() ? selectionStart() : caret;
+        int s = Math.max(0, cursor - length);
+        return document.substring(s, cursor);
     }
 
     CharSequence textAfterCursor(int length) {
-        int e = Math.min(document.length(), caret + length);
-        return document.substring(caret, e);
+        if (document == null || length <= 0) return "";
+        // InputConnection cursor is the end of selection for "after".
+        int cursor = hasSelection() ? selectionEnd() : caret;
+        int e = Math.min(document.length(), cursor + length);
+        return document.substring(cursor, e);
+    }
+
+    CharSequence selectedTextForIme() {
+        if (!hasSelection() || document == null) return null;
+        int s = selectionStart();
+        int e = selectionEnd();
+        if (s == e) return null;
+        return document.substring(s, e);
+    }
+
+    int cursorCapsMode(int reqModes) {
+        if (document == null) return 0;
+        // TextUtils.getCapsMode understands the same CAP_MODE_* bits that
+        // EditorInfo / InputType use for TYPE_TEXT_FLAG_CAP_*.
+        return TextUtils.getCapsMode(document, caret, reqModes);
+    }
+
+    ExtractedText extractedTextForIme(ExtractedTextRequest request) {
+        if (document == null) return null;
+        ExtractedText et = new ExtractedText();
+        // Cap the snapshot so a multi-MB buffer never freezes the IME thread.
+        final int MAX = 32 * 1024;
+        int len = document.length();
+        int start = 0;
+        int end = len;
+        if (len > MAX) {
+            // Prefer a window around the caret.
+            start = Math.max(0, caret - MAX / 2);
+            end = Math.min(len, start + MAX);
+            start = Math.max(0, end - MAX);
+        }
+        et.text = document.substring(start, end);
+        et.startOffset = start;
+        et.partialStartOffset = -1;
+        et.partialEndOffset = -1;
+        int selStart = hasSelection() ? selectionStart() : caret;
+        int selEnd = hasSelection() ? selectionEnd() : caret;
+        et.selectionStart = Math.max(0, selStart - start);
+        et.selectionEnd = Math.max(0, selEnd - start);
+        et.flags = 0;
+        if (request != null) {
+            extractedToken = request.token;
+        }
+        return et;
+    }
+
+    void onExtractedTextRequested(ExtractedTextRequest request, int flags) {
+        if (request != null) {
+            extractedToken = request.token;
+        }
+        extractedMonitor =
+                (flags & InputConnection.GET_EXTRACTED_TEXT_MONITOR) != 0;
+    }
+
+    /**
+     * Apply InputConnection's newCursorPosition relative to an insertion of
+     * {@code insertLen} characters that began at {@code insertAt}.
+     */
+    private void applyImeCursorPosition(int insertAt, int insertLen,
+                                        int newCursorPosition) {
+        if (newCursorPosition > 0) {
+            // Relative to one char before end: 1 means just after inserted text.
+            caret = insertAt + insertLen + (newCursorPosition - 1);
+        } else {
+            // <=0 is relative to the replacement start: 0 means before text.
+            caret = insertAt + newCursorPosition;
+        }
+        caret = Math.max(0, Math.min(caret, document.length()));
+        selectionAnchor = -1;
+    }
+
+    /**
+     * Push selection + composing span to the IME so suggestion / gesture
+     * engines stay aligned with the piece table. Also refreshes extracted
+     * text when the IME asked for continuous monitoring.
+     */
+    private void notifyImeSelection() {
+        if (!isAttachedToWindow() || document == null) return;
+        int selStart = hasSelection() ? selectionStart() : caret;
+        int selEnd = hasSelection() ? selectionEnd() : caret;
+        int compStart = composingStart >= 0 ? composingStart : -1;
+        int compEnd = composingEnd >= 0 ? composingEnd : -1;
+        long version = document.version();
+        boolean positionsUnchanged = selStart == lastImmSelStart
+                && selEnd == lastImmSelEnd
+                && compStart == lastImmCompStart
+                && compEnd == lastImmCompEnd;
+        boolean textUnchanged = version == lastImmDocumentVersion;
+        if (positionsUnchanged && textUnchanged) {
+            return;
+        }
+        lastImmSelStart = selStart;
+        lastImmSelEnd = selEnd;
+        lastImmCompStart = compStart;
+        lastImmCompEnd = compEnd;
+        lastImmDocumentVersion = version;
+        InputMethodManager imm = (InputMethodManager)
+                getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (imm == null) return;
+        // Calling this even when only text changed is intentional: several
+        // English IMEs use it as the signal to re-query surrounding text.
+        imm.updateSelection(this, selStart, selEnd, compStart, compEnd);
+        if (extractedMonitor) {
+            ExtractedText et = extractedTextForIme(null);
+            if (et != null) {
+                imm.updateExtractedText(this, extractedToken, et);
+            }
+        }
+    }
+
+    /** Force the IME to re-read surrounding text (after big external edits). */
+    private void restartImeInput() {
+        lastImmSelStart = lastImmSelEnd = lastImmCompStart = lastImmCompEnd = -1;
+        lastImmDocumentVersion = -1;
+        InputMethodManager imm = (InputMethodManager)
+                getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (imm != null) {
+            imm.restartInput(this);
+        }
     }
 
     @Override
@@ -750,11 +1759,43 @@ public class CodeEditorView extends View
 
     @Override
     public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
-        outAttrs.inputType = EditorInfo.TYPE_CLASS_TEXT
-                | EditorInfo.TYPE_TEXT_FLAG_MULTI_LINE
-                | EditorInfo.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+        // Allow the system English suggestion bar / gesture typing. Code
+        // editors still want multi-line + no extract/fullscreen chrome, but
+        // NO_SUGGESTIONS was killing Gboard/Samsung predictive input.
+        outAttrs.inputType = InputType.TYPE_CLASS_TEXT
+                | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                | InputType.TYPE_TEXT_FLAG_AUTO_CORRECT
+                | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES;
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI
-                | EditorInfo.IME_FLAG_NO_FULLSCREEN;
+                | EditorInfo.IME_FLAG_NO_FULLSCREEN
+                | EditorInfo.IME_ACTION_NONE;
+        int selStart = hasSelection() ? selectionStart() : caret;
+        int selEnd = hasSelection() ? selectionEnd() : caret;
+        outAttrs.initialSelStart = selStart;
+        outAttrs.initialSelEnd = selEnd;
+        outAttrs.initialCapsMode = cursorCapsMode(
+                TextUtils.CAP_MODE_CHARACTERS
+                        | TextUtils.CAP_MODE_WORDS
+                        | TextUtils.CAP_MODE_SENTENCES);
+        // Seed surrounding text so the first suggestion round doesn't wait
+        // for a getTextBeforeCursor round-trip. API 30+.
+        if (document != null
+                && android.os.Build.VERSION.SDK_INT >= 30) {
+            final int SEED = 2048;
+            int seedStart = Math.max(0, caret - SEED);
+            int seedEnd = Math.min(document.length(), caret + SEED);
+            CharSequence surrounding = document.substring(seedStart, seedEnd);
+            outAttrs.setInitialSurroundingSubText(surrounding, seedStart);
+        }
+        lastImmSelStart = selStart;
+        lastImmSelEnd = selEnd;
+        lastImmCompStart = composingStart;
+        lastImmCompEnd = composingEnd;
+        lastImmDocumentVersion = document == null ? -1 : document.version();
+        extractedMonitor = false;
+        if (android.os.Build.VERSION.SDK_INT >= 34) {
+            return new EditorInputConnectionApi34(this);
+        }
         return new EditorInputConnection(this);
     }
 
@@ -798,18 +1839,21 @@ public class CodeEditorView extends View
                 deleteForward();
                 return true;
             case KeyEvent.KEYCODE_ENTER:
-                insertAtCaret("\n" + autoIndentForCaretLine());
-                dismissCompletions();
+                insertNewlineWithIndent();
                 return true;
             case KeyEvent.KEYCODE_TAB:
-                insertAtCaret("    ");
+                if (shift) {
+                    outdentSelectionOrLine();
+                } else {
+                    indentSelectionOrInsertTab();
+                }
                 return true;
             case KeyEvent.KEYCODE_DPAD_LEFT:
-                moveCaretTo(caret - 1, shift);
+                moveCaretTo(prevClusterOffset(caret), shift);
                 dismissCompletions();
                 return true;
             case KeyEvent.KEYCODE_DPAD_RIGHT:
-                moveCaretTo(caret + 1, shift);
+                moveCaretTo(nextClusterOffset(caret), shift);
                 dismissCompletions();
                 return true;
             case KeyEvent.KEYCODE_DPAD_UP:
@@ -889,24 +1933,230 @@ public class CodeEditorView extends View
         return super.onKeyDown(keyCode, event);
     }
 
-    /** Leading whitespace of the caret's line, plus one level after '{'. */
-    private String autoIndentForCaretLine() {
-        int line = document.lineOfOffset(caret);
+    // ------------------------------------------------------------------
+    // Auto-indent
+    // ------------------------------------------------------------------
+
+    /** One indent step: currently four spaces (matches TAB_SIZE). */
+    private String indentUnit() {
+        // Keep in sync with TAB_SIZE so tab stops and indent levels agree.
+        char[] unit = new char[TAB_SIZE];
+        Arrays.fill(unit, ' ');
+        return new String(unit);
+    }
+
+    private static boolean isIndentWs(char c) {
+        return c == ' ' || c == '\t';
+    }
+
+    private static boolean isOnlyNewlines(String text) {
+        if (text.isEmpty()) return false;
+        for (int i = 0; i < text.length(); i++) {
+            if (text.charAt(i) != '\n') return false;
+        }
+        return true;
+    }
+
+    /** Leading spaces/tabs of a line (content only — no trailing newline). */
+    private String leadingWhitespaceOfLine(int line) {
+        if (document == null || line < 0 || line >= document.lineCount()) {
+            return "";
+        }
         int start = document.lineStart(line);
-        int end = Math.min(caret, document.lineEnd(line));
-        StringBuilder indent = new StringBuilder();
+        int end = document.lineEnd(line);
+        StringBuilder sb = new StringBuilder();
         for (int i = start; i < end; i++) {
             char c = document.charAt(i);
-            if (c == ' ' || c == '\t') {
-                indent.append(c);
-            } else {
-                break;
+            if (isIndentWs(c)) sb.append(c);
+            else break;
+        }
+        return sb.toString();
+    }
+
+    /**
+     * When the user types {@code }} on a line that is only whitespace + that
+     * brace, drop one indent level so the closer aligns with its opener.
+     */
+    private void maybeOutdentBeforeClosingBrace() {
+        int line = document.lineOfOffset(caret);
+        int start = document.lineStart(line);
+        int end = document.lineEnd(line);
+        // Only act when every char before the caret on this line is indent ws
+        // and nothing non-ws follows the caret on the line either.
+        for (int i = start; i < caret; i++) {
+            if (!isIndentWs(document.charAt(i))) return;
+        }
+        for (int i = caret; i < end; i++) {
+            if (!isIndentWs(document.charAt(i))) return;
+        }
+        String indent = leadingWhitespaceOfLine(line);
+        if (indent.isEmpty()) return;
+        String unit = indentUnit();
+        String reduced;
+        if (indent.endsWith(unit)) {
+            reduced = indent.substring(0, indent.length() - unit.length());
+        } else if (indent.charAt(indent.length() - 1) == '\t') {
+            reduced = indent.substring(0, indent.length() - 1);
+        } else {
+            // Partial spaces: peel off up to TAB_SIZE trailing spaces.
+            int peel = 0;
+            for (int i = indent.length() - 1; i >= 0 && peel < TAB_SIZE; i--) {
+                if (indent.charAt(i) != ' ') break;
+                peel++;
+            }
+            if (peel == 0) return;
+            reduced = indent.substring(0, indent.length() - peel);
+        }
+        // Replace the leading whitespace in place; caret stays just after it.
+        document.replace(start, start + indent.length(), reduced);
+        caret = start + reduced.length();
+    }
+
+    /**
+     * Paste / multi-line IME commit: first line as-is at caret, subsequent
+     * lines rebased onto the insertion line's indent (plus extra after `{`).
+     */
+    private void insertMultilineIndented(String text) {
+        deleteSelectionIfAny();
+        String base = leadingWhitespaceOfLine(document.lineOfOffset(caret));
+        // Extra level when inserting right after an opener.
+        int line = document.lineOfOffset(caret);
+        int lineStart = document.lineStart(line);
+        int before = caret - 1;
+        while (before >= lineStart && isIndentWs(document.charAt(before))) before--;
+        if (before >= lineStart) {
+            char c = document.charAt(before);
+            if (c == '{' || c == '(' || c == '[') base = base + indentUnit();
+        }
+
+        StringBuilder out = new StringBuilder(text.length() + 16);
+        int i = 0;
+        // First segment (before any \n) is inserted raw — caret may sit mid-line.
+        while (i < text.length() && text.charAt(i) != '\n') {
+            out.append(text.charAt(i++));
+        }
+        while (i < text.length()) {
+            out.append('\n');
+            i++; // skip the \n
+            // Strip the source line's own leading ws, then apply base.
+            while (i < text.length() && isIndentWs(text.charAt(i))) i++;
+            if (i < text.length() && text.charAt(i) != '\n') {
+                out.append(base);
+            }
+            while (i < text.length() && text.charAt(i) != '\n') {
+                out.append(text.charAt(i++));
             }
         }
-        if (end > start && document.charAt(end - 1) == '{') {
-            indent.append("    ");
+        String insert = out.toString();
+        document.insert(caret, insert);
+        caret += insert.length();
+        afterEdit();
+        dismissCompletions();
+    }
+
+    /** Tab with a selection indents every touched line; bare Tab inserts a unit. */
+    private void indentSelectionOrInsertTab() {
+        if (!hasSelection()) {
+            insertAtCaret(indentUnit());
+            return;
         }
-        return indent.toString();
+        int s = selectionStart();
+        int e = selectionEnd();
+        int firstLine = document.lineOfOffset(s);
+        int lastLine = document.lineOfOffset(Math.max(s, e - 1));
+        String unit = indentUnit();
+        // Edit bottom-up so earlier offsets stay valid.
+        undoManager.beginBatch();
+        try {
+            for (int line = lastLine; line >= firstLine; line--) {
+                int ls = document.lineStart(line);
+                document.insert(ls, unit);
+            }
+        } finally {
+            undoManager.endBatch();
+        }
+        // Selection grows by one unit per line on the end side; start shifts too.
+        int lines = lastLine - firstLine + 1;
+        selectionAnchor = s + unit.length();
+        caret = e + unit.length() * lines;
+        afterEdit();
+        dismissCompletions();
+    }
+
+    /** Shift+Tab: remove one indent unit from each selected (or caret) line. */
+    private void outdentSelectionOrLine() {
+        final boolean hadSelection = hasSelection();
+        int s = hadSelection ? selectionStart() : caret;
+        int e = hadSelection ? selectionEnd() : caret;
+        int firstLine = document.lineOfOffset(s);
+        // Caret at column 0 of line N+1 after selecting line N's '\n' must not
+        // outdent line N+1 — bound the range by the last selected character.
+        int lastLine = document.lineOfOffset(e > s ? e - 1 : e);
+        int lineCount = lastLine - firstLine + 1;
+        if (lineCount <= 0) return;
+
+        // Snapshot original line starts + peels BEFORE any mutation.
+        int[] origStarts = new int[lineCount];
+        int[] peels = new int[lineCount];
+        for (int i = 0; i < lineCount; i++) {
+            int line = firstLine + i;
+            int ls = document.lineStart(line);
+            int le = document.lineEnd(line);
+            origStarts[i] = ls;
+            int peel = 0;
+            if (ls < le && document.charAt(ls) == '\t') {
+                peel = 1;
+            } else {
+                while (ls + peel < le && peel < TAB_SIZE
+                        && document.charAt(ls + peel) == ' ') {
+                    peel++;
+                }
+            }
+            peels[i] = peel;
+        }
+
+        undoManager.beginBatch();
+        try {
+            // Bottom-up so earlier line starts stay valid during the loop.
+            for (int i = lineCount - 1; i >= 0; i--) {
+                if (peels[i] == 0) continue;
+                int ls = document.lineStart(firstLine + i);
+                document.delete(ls, ls + peels[i]);
+            }
+        } finally {
+            undoManager.endBatch();
+        }
+
+        int newS = s - charsRemovedBefore(s, origStarts, peels);
+        int newE = e - charsRemovedBefore(e, origStarts, peels);
+        if (newS < 0) newS = 0;
+        if (newE < newS) newE = newS;
+        if (hadSelection) {
+            selectionAnchor = newS;
+            caret = newE;
+        } else {
+            caret = newS;
+            selectionAnchor = -1;
+        }
+        afterEdit();
+        dismissCompletions();
+    }
+
+    /**
+     * How many leading-indent characters were peeled at offsets strictly
+     * before {@code offset} (and partially if {@code offset} sat inside a
+     * peeled run).
+     */
+    private static int charsRemovedBefore(int offset, int[] origStarts, int[] peels) {
+        int removed = 0;
+        for (int i = 0; i < peels.length; i++) {
+            int peel = peels[i];
+            if (peel == 0) continue;
+            int os = origStarts[i];
+            if (offset >= os + peel) removed += peel;
+            else if (offset > os) removed += offset - os;
+        }
+        return removed;
     }
 
     // ------------------------------------------------------------------
@@ -1061,6 +2311,26 @@ public class CodeEditorView extends View
                 }
             }
 
+            // LSP diagnostic underlines (drawn under the glyphs).
+            drawDiagnosticsForLine(canvas, line, lineStart, contentLen,
+                    gw, top, lh, xs);
+
+            // IME composing region — underline the preedit so English
+            // suggestions / CJK composition remain visible.
+            if (composingStart >= 0 && composingEnd > composingStart) {
+                int lineEndOff = lineStart + contentLen;
+                int cs = Math.max(composingStart, lineStart);
+                int ce = Math.min(composingEnd, lineEndOff);
+                if (cs < ce) {
+                    float x1 = gw + xs[cs - lineStart];
+                    float x2 = gw + xs[ce - lineStart];
+                    float uy = top + lh - Math.max(2f, density);
+                    diagnosticPaint.setColor(scheme.composingUnderline);
+                    diagnosticPaint.setStrokeWidth(Math.max(1.5f, 1.5f * density));
+                    canvas.drawLine(x1, uy, x2, uy, diagnosticPaint);
+                }
+            }
+
             // Text with spans. Stale spans (right after an edit, before the
             // worker republishes) are still painted — columns are clipped to
             // contentLen so we never read past the new line end. This is what
@@ -1082,9 +2352,13 @@ public class CodeEditorView extends View
                         Math.min(contentLen, caret - lineStart));
                 float cx = gw + xs[caretColumn];
                 fillPaint.setColor(scheme.caret);
-                // 2-device-px wide caret, pixel-aligned.
-                float caretW = Math.max(2f, density);
-                canvas.drawRect(cx, top, cx + caretW, top + lh, fillPaint);
+                // Keep the insertion caret on the preceding side of the
+                // boundary so it never paints over the next glyph (n|g).
+                // At column zero there is no preceding cell, so draw right.
+                float caretW = 2f; // physical pixels: stable across zoom levels
+                float caretLeft = caretColumn == 0 ? cx : cx - caretW;
+                canvas.drawRect(caretLeft, top, caretLeft + caretW,
+                        top + lh, fillPaint);
             }
         }
         canvas.restoreToCount(save);
@@ -1098,10 +2372,16 @@ public class CodeEditorView extends View
         }
     }
 
-    /** Teardrop handles at the selection ends — only while a range is selected. */
+    /**
+     * Selection handles drawn with the platform's own
+     * {@code textSelectHandleLeft/Right} drawables (resolved from the activity
+     * theme). Falls back to a simple filled teardrop only if the theme has
+     * none — on a normal Material/AppCompat activity the native assets win.
+     */
     private void drawSelectionHandles(Canvas canvas) {
         if (!hasSelection()) return;
-        handlePaint.setColor(scheme.selectionHandle);
+        // Keep tint in sync with the colour scheme (e.g. after a theme swap).
+        tintHandleDrawables();
         drawHandleAt(canvas, selectionStart(), /*start*/ true);
         drawHandleAt(canvas, selectionEnd(), /*start*/ false);
     }
@@ -1110,36 +2390,154 @@ public class CodeEditorView extends View
      * Draws one handle in the same content coordinate system as the text.
      * {@link View#scrollTo(int, int)} already translates the Canvas before
      * {@link #onDraw(Canvas)}; subtracting scroll here again would apply the
-     * offset twice. That bug becomes very visible after pinch zoom changes
-     * both metrics and scroll position. Hit testing stays view-local via
+     * offset twice. Hit testing stays view-local via
      * {@link #handleViewPos(int, boolean)}.
      */
     private void drawHandleAt(Canvas canvas, int offset, boolean startHandle) {
         if (document == null || lineHeight <= 0f) return;
         int line = document.lineOfOffset(offset);
-        float x = contentXForOffset(offset);
-        float lineTop = line * lineHeight;
-        float lineBottom = lineTop + lineHeight;
-        float r = handleRadius;
+        float tipX = contentXForOffset(offset);
+        float tipY = (line + 1) * lineHeight; // bottom edge of the line
 
-        handlePath.reset();
-        if (startHandle) {
-            // Circle centred above the line, with a tip pointing down to the edge.
-            float cy = lineTop - r * 0.55f;
-            handlePath.addCircle(x, cy, r, Path.Direction.CW);
-            handlePath.moveTo(x - r * 0.55f, cy + r * 0.55f);
-            handlePath.lineTo(x, lineTop + density);
-            handlePath.lineTo(x + r * 0.55f, cy + r * 0.55f);
-            handlePath.close();
-        } else {
-            float cy = lineBottom + r * 0.55f;
-            handlePath.addCircle(x, cy, r, Path.Direction.CW);
-            handlePath.moveTo(x - r * 0.55f, cy - r * 0.55f);
-            handlePath.lineTo(x, lineBottom - density);
-            handlePath.lineTo(x + r * 0.55f, cy - r * 0.55f);
-            handlePath.close();
+        Drawable d = startHandle ? handleLeftDrawable : handleRightDrawable;
+        if (d != null) {
+            int w = d.getIntrinsicWidth() > 0 ? d.getIntrinsicWidth()
+                    : Math.round(handleRadius * 2f);
+            int h = d.getIntrinsicHeight() > 0 ? d.getIntrinsicHeight()
+                    : Math.round(handleRadius * 2f);
+            // Left handle tip = top-right corner; right handle tip = top-left.
+            int left = startHandle ? Math.round(tipX - w) : Math.round(tipX);
+            int top = Math.round(tipY);
+            d.setBounds(left, top, left + w, top + h);
+            d.draw(canvas);
+            return;
         }
-        canvas.drawPath(handlePath, handlePaint);
+
+        // Theme-less fallback: simple circle body hanging below the tip.
+        float r = handleRadius;
+        float cx = startHandle ? tipX - r * 0.65f : tipX + r * 0.65f;
+        float cy = tipY + r * 0.95f;
+        fillPaint.setColor(scheme.selectionHandle);
+        canvas.drawCircle(cx, cy, r, fillPaint);
+        // Tiny stem up to the baseline so the tip still reads as attached.
+        canvas.drawLine(tipX, tipY, cx, cy - r * 0.4f, fillPaint);
+    }
+
+    /**
+     * Squiggly underline for every diagnostic that intersects {@code line}.
+     * Coordinates match the text run (content space, gutter already added).
+     */
+    private void drawDiagnosticsForLine(Canvas canvas, int line, int lineStart,
+                                        int contentLen, float gw, float top,
+                                        float lh, float[] xs) {
+        if (diagnostics.isEmpty() || contentLen < 0) return;
+        float y = top + lh - Math.max(2f, density);
+        for (int i = 0, n = diagnostics.size(); i < n; i++) {
+            Diagnostic d = diagnostics.get(i);
+            if (d.endLine < line || d.startLine > line) continue;
+            int startCol = (d.startLine == line) ? d.startCharacter : 0;
+            int endCol = (d.endLine == line) ? d.endCharacter : contentLen;
+            startCol = Math.max(0, Math.min(startCol, contentLen));
+            endCol = Math.max(startCol, Math.min(endCol, contentLen));
+            // Zero-width (e.g. "expected ;") — underline one em at the point.
+            float x1 = gw + xs[startCol];
+            float x2 = (endCol > startCol) ? gw + xs[endCol] : x1 + Math.max(charWidth, 4f);
+            diagnosticPaint.setColor(colorForSeverity(d.severity));
+            drawSquiggle(canvas, x1, x2, y);
+        }
+    }
+
+    private void drawSquiggle(Canvas canvas, float x1, float x2, float y) {
+        if (x2 <= x1) return;
+        float amp = Math.max(1.5f, 1.6f * density);
+        float step = Math.max(3f, 3.2f * density);
+        float x = x1;
+        float dir = 1f;
+        float prevX = x;
+        float prevY = y;
+        x += step * 0.5f;
+        while (x < x2) {
+            float ny = y + dir * amp;
+            canvas.drawLine(prevX, prevY, x, ny, diagnosticPaint);
+            prevX = x;
+            prevY = ny;
+            dir = -dir;
+            x += step;
+        }
+        canvas.drawLine(prevX, prevY, x2, y, diagnosticPaint);
+    }
+
+    private int colorForSeverity(int severity) {
+        switch (severity) {
+            case Diagnostic.SEVERITY_ERROR:   return scheme.diagnosticError;
+            case Diagnostic.SEVERITY_WARNING: return scheme.diagnosticWarning;
+            case Diagnostic.SEVERITY_INFORMATION: return scheme.diagnosticInfo;
+            case Diagnostic.SEVERITY_HINT:
+            default:                          return scheme.diagnosticHint;
+        }
+    }
+
+    /** Lowest severity number on the line wins (Error=1 beats Hint=4). */
+    private int worstDiagnosticSeverityOnLine(int line) {
+        int worst = 0;
+        for (int i = 0, n = diagnostics.size(); i < n; i++) {
+            Diagnostic d = diagnostics.get(i);
+            if (d.startLine <= line && d.endLine >= line) {
+                if (worst == 0 || d.severity < worst) worst = d.severity;
+            }
+        }
+        return worst;
+    }
+
+    /**
+     * Resolve {@link android.R.attr#textSelectHandleLeft} /
+     * {@link android.R.attr#textSelectHandleRight} from the host theme and
+     * keep mutated copies so tinting does not leak into other widgets.
+     */
+    private void loadHandleDrawables() {
+        handleLeftDrawable = null;
+        handleRightDrawable = null;
+        handleIntrinsicW = 0;
+        handleIntrinsicH = 0;
+        Context ctx = getContext();
+        if (ctx == null) return;
+        final int[] attrs = new int[] {
+                android.R.attr.textSelectHandleLeft,
+                android.R.attr.textSelectHandleRight
+        };
+        TypedArray ta = null;
+        try {
+            ta = ctx.obtainStyledAttributes(attrs);
+            Drawable left = ta.getDrawable(0);
+            Drawable right = ta.getDrawable(1);
+            if (left != null) handleLeftDrawable = left.mutate();
+            if (right != null) handleRightDrawable = right.mutate();
+        } catch (Exception ignored) {
+            // Some host themes / test stubs omit the attrs — fall back later.
+        } finally {
+            if (ta != null) ta.recycle();
+        }
+        tintHandleDrawables();
+        Drawable ref = handleLeftDrawable != null
+                ? handleLeftDrawable : handleRightDrawable;
+        if (ref != null) {
+            handleIntrinsicW = Math.max(1, ref.getIntrinsicWidth());
+            handleIntrinsicH = Math.max(1, ref.getIntrinsicHeight());
+            // Size the hit target from the real asset.
+            handleRadius = Math.max(handleRadius,
+                    Math.max(handleIntrinsicW, handleIntrinsicH) * 0.45f);
+        }
+    }
+
+    private void tintHandleDrawables() {
+        int color = scheme.selectionHandle;
+        // setTint is the non-deprecated path (API 21+; our minSdk is 24).
+        if (handleLeftDrawable != null) {
+            handleLeftDrawable.setTint(color);
+        }
+        if (handleRightDrawable != null) {
+            handleRightDrawable.setTint(color);
+        }
     }
 
     /**
@@ -1202,7 +2600,9 @@ public class CodeEditorView extends View
 
     /**
      * Draws a measured range, expanding tabs to the same stops used by
-     * hit-testing. Non-tab runs use Canvas's fast substring draw path.
+     * hit-testing. Non-tab runs use the whole line as shaping context, so
+     * syntax-color boundaries cannot change kerning/ligatures or move the
+     * visual glyphs away from the measured caret positions.
      */
     private void drawMeasuredRange(Canvas canvas, String text, int start, int end,
                                    float x, float baseline, float[] xs) {
@@ -1210,15 +2610,19 @@ public class CodeEditorView extends View
         for (int i = start; i < end; i++) {
             if (text.charAt(i) != '\t') continue;
             if (runStart < i) {
-                canvas.drawText(text, runStart, i,
-                        x + xs[runStart] - xs[start], baseline, textPaint);
+                canvas.drawTextRun(text, runStart, i,
+                        0, text.length(),
+                        x + xs[runStart] - xs[start], baseline,
+                        false, textPaint);
             }
             // Tab is spacing only; next run begins at its measured tab stop.
             runStart = i + 1;
         }
         if (runStart < end) {
-            canvas.drawText(text, runStart, end,
-                    x + xs[runStart] - xs[start], baseline, textPaint);
+            canvas.drawTextRun(text, runStart, end,
+                    0, text.length(),
+                    x + xs[runStart] - xs[start], baseline,
+                    false, textPaint);
         }
     }
 
@@ -1232,29 +2636,14 @@ public class CodeEditorView extends View
             int cap = Math.max(needed, columnXs.length * 2);
             columnXs = new float[cap];
             glyphWidths = new float[cap];
+            textChars = new char[cap];
         }
         columnXs[0] = 0f;
         if (length == 0) return columnXs;
 
-        // Hot path for the overwhelmingly common source-code line: ASCII,
-        // no tabs. The configured monospace face gives every ASCII glyph the
-        // same advance, so avoid a native getTextWidths() call per frame.
-        boolean simpleMonospace = true;
-        for (int i = 0; i < length; i++) {
-            char c = text.charAt(i);
-            if (c == '\t' || c < 0x20 || c > 0x7E) {
-                simpleMonospace = false;
-                break;
-            }
-        }
-        if (simpleMonospace) {
-            for (int i = 1; i <= length; i++) {
-                columnXs[i] = i * charWidth;
-            }
-            return columnXs;
-        }
-
-        textPaint.getTextWidths(text, 0, length, glyphWidths);
+        text.getChars(0, length, textChars, 0);
+        textPaint.getTextRunAdvances(textChars, 0, length,
+                0, length, false, glyphWidths, 0);
         float x = 0f;
         float tabWidth = Math.max(1f, charWidth * TAB_SIZE);
         for (int i = 0; i < length; i++) {
@@ -1294,6 +2683,7 @@ public class CodeEditorView extends View
         if (firstLine > lastLine || lineHeight <= 0f) return;
 
         final float rightPad = gutterPad;
+        final float tickR = Math.max(2.5f * density, 3f);
         for (int line = firstLine; line <= lastLine; line++) {
             float baseline = line * lineHeight + baselineShift;
             gutterPaint.setColor(line == caretLine
@@ -1303,6 +2693,14 @@ public class CodeEditorView extends View
             canvas.drawText(num,
                     scrollX + gutterWidth - numWidth - rightPad,
                     baseline, gutterPaint);
+
+            // Diagnostic severity tick on the left edge of the gutter.
+            int sev = worstDiagnosticSeverityOnLine(line);
+            if (sev > 0) {
+                fillPaint.setColor(colorForSeverity(sev));
+                float cy = line * lineHeight + lineHeight * 0.5f;
+                canvas.drawCircle(scrollX + tickR + density, cy, tickR, fillPaint);
+            }
         }
     }
 
@@ -1322,121 +2720,280 @@ public class CodeEditorView extends View
 
     @Override
     public boolean onTouchEvent(MotionEvent event) {
-        // Pinch first; it needs the raw stream.
-        scaleDetector.onTouchEvent(event);
-
         final int action = event.getActionMasked();
         final int pointerCount = event.getPointerCount();
-        final float x = event.getX();
-        final float y = event.getY();
 
-        // Multi-touch: cancel any single-finger selection/tap work.
+        // The second pointer atomically ends every single-finger mode before
+        // ScaleGestureDetector sees the event. The final remaining-finger UP
+        // stays suppressed until the complete multi-touch sequence is over.
         if (action == MotionEvent.ACTION_POINTER_DOWN && pointerCount >= 2) {
-            beginMultiTouchSession(event);
-            activeHandle = Handle.NONE;
-            fingerSelecting = false;
-            panning = false;
+            // The first finger may have been tentatively recognised as the
+            // second tap on DOWN. A pinch is viewport-only, so roll back any
+            // state mutation from that still-active single-pointer sequence.
+            if (touchMode == TouchMode.DOUBLE_TAP_LOCKED
+                    || touchMode == TouchMode.DOUBLE_TAP_EXTENDING) {
+                caret = Math.max(0, Math.min(touchStartCaret, document.length()));
+                selectionAnchor = touchStartSelectionAnchor < 0
+                        ? -1
+                        : Math.max(0, Math.min(
+                                touchStartSelectionAnchor, document.length()));
+                invalidate();
+            }
+            cancelManualTouch(false);
+            beginMultiTouchSession();
+            scaleDetector.onTouchEvent(event);
             if (getParent() != null) {
-                getParent().requestDisallowInterceptTouchEvent(false);
+                // Keep the complete pinch stream in the editor. Releasing this
+                // here lets a ScrollView steal the next MOVE and abort zoom.
+                getParent().requestDisallowInterceptTouchEvent(true);
             }
             return true;
         }
+
+        scaleDetector.onTouchEvent(event);
         if (suppressSingleFingerGestures || scaling
                 || pointerCount > 1 || scaleDetector.isInProgress()) {
             if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
                 scaling = false;
                 suppressSingleFingerGestures = false;
-                dispatchGestureCancel(event);
+                cancelManualTouch(false);
+                if (getParent() != null) {
+                    getParent().requestDisallowInterceptTouchEvent(false);
+                }
                 resetCaretBlink();
             }
             return true;
         }
 
-        switch (action) {
-            case MotionEvent.ACTION_DOWN: {
-                downX = x;
-                downY = y;
-                panning = false;
-                doubleTapHandled = false;
-                scroller.forceFinished(true);
-                // Keep parent scroll containers from stealing our long-press.
-                if (getParent() != null) {
-                    getParent().requestDisallowInterceptTouchEvent(true);
-                }
+        final float x = event.getX();
+        final float y = event.getY();
 
-                Handle hit = hitTestHandle(x, y);
-                if (hit != Handle.NONE) {
-                    activeHandle = hit;
-                    fingerSelecting = true;
-                    dismissCompletions();
-                    // Do not feed this DOWN to GestureDetector — it is a handle grab.
-                    return true;
-                }
-                activeHandle = Handle.NONE;
-                fingerSelecting = false;
-                gestureDetector.onTouchEvent(event);
+        switch (action) {
+            case MotionEvent.ACTION_DOWN:
+                beginSingleTouch(event, x, y);
                 return true;
-            }
-            case MotionEvent.ACTION_MOVE: {
-                if (activeHandle != Handle.NONE || fingerSelecting) {
-                    // Extend / drag selection; block parent intercept.
-                    if (getParent() != null) {
-                        getParent().requestDisallowInterceptTouchEvent(true);
-                    }
-                    dragSelectionTo(x, y);
-                    return true;
-                }
-                float dx = x - downX;
-                float dy = y - downY;
-                // Once clearly panning, allow parent to take over if it wants
-                // horizontal gestures outside the editor — but we still scroll.
-                if (!panning && dx * dx + dy * dy > touchSlop * touchSlop) {
-                    panning = true;
-                }
-                gestureDetector.onTouchEvent(event);
+
+            case MotionEvent.ACTION_MOVE:
+                addMovement(event);
+                updateSingleTouch(x, y);
+                lastTouchX = x;
+                lastTouchY = y;
                 return true;
-            }
+
             case MotionEvent.ACTION_UP:
-            case MotionEvent.ACTION_CANCEL: {
-                boolean wasHandle = activeHandle != Handle.NONE || fingerSelecting;
-                if (wasHandle) {
-                    activeHandle = Handle.NONE;
-                    fingerSelecting = false;
-                    dispatchGestureCancel(event);
-                    invalidate();
-                } else {
-                    gestureDetector.onTouchEvent(event);
-                }
-                panning = false;
-                if (getParent() != null) {
-                    getParent().requestDisallowInterceptTouchEvent(false);
-                }
+                addMovement(event);
+                finishSingleTouch(event, x, y, false);
                 return true;
-            }
+
+            case MotionEvent.ACTION_CANCEL:
+                finishSingleTouch(event, x, y, true);
+                return true;
+
             default:
-                gestureDetector.onTouchEvent(event);
                 return true;
         }
     }
 
-    /** Marks the current touch sequence as multi-touch and cancels taps. */
-    private void beginMultiTouchSession(MotionEvent event) {
+    private void onManualLongPressTimeout() {
+        if (touchMode != TouchMode.TAP_PENDING || suppressSingleFingerGestures
+                || scaling || document == null) {
+            return;
+        }
+        activateWordSelectionAt(downX, downY, false);
+        touchMode = TouchMode.LONG_PRESS_LOCKED;
+    }
+
+    private void beginSingleTouch(MotionEvent event, float x, float y) {
+        removeCallbacks(longPressRunnable);
+        recycleVelocityTracker();
+        velocityTracker = VelocityTracker.obtain();
+        velocityTracker.addMovement(event);
+
+        downX = lastTouchX = x;
+        downY = lastTouchY = y;
+        touchStartCaret = caret;
+        touchStartSelectionAnchor = selectionAnchor;
+        scroller.forceFinished(true);
+
+        if (getParent() != null) {
+            getParent().requestDisallowInterceptTouchEvent(true);
+        }
+
+        Handle hit = hitTestHandle(x, y);
+        if (hit != Handle.NONE) {
+            activeHandle = hit;
+            touchMode = TouchMode.HANDLE_DRAG;
+            dismissCompletions();
+            lastTapUpTime = 0L;
+            return;
+        }
+        activeHandle = Handle.NONE;
+
+        if (isSecondTap(event, x, y)) {
+            // Recognise on the second DOWN. The first tap already moved the
+            // caret immediately; no delayed onSingleTapConfirmed is needed.
+            lastTapUpTime = 0L;
+            activateWordSelectionAt(x, y, true);
+            return;
+        }
+
+        touchMode = TouchMode.TAP_PENDING;
+        postDelayed(longPressRunnable, ViewConfiguration.getLongPressTimeout());
+    }
+
+    private boolean isSecondTap(MotionEvent event, float x, float y) {
+        if (lastTapUpTime == 0L) return false;
+        long elapsed = event.getEventTime() - lastTapUpTime;
+        if (elapsed < DOUBLE_TAP_MIN_TIME_MS
+                || elapsed > ViewConfiguration.getDoubleTapTimeout()) {
+            lastTapUpTime = 0L;
+            return false;
+        }
+        float dx = x - lastTapX;
+        float dy = y - lastTapY;
+        return dx * dx + dy * dy <= doubleTapSlop * doubleTapSlop;
+    }
+
+    private void updateSingleTouch(float x, float y) {
+        switch (touchMode) {
+            case HANDLE_DRAG:
+                dragSelectionTo(x, y);
+                return;
+
+            case LONG_PRESS_LOCKED:
+            case DOUBLE_TAP_LOCKED:
+                if (movedPastSlop(x, y)) {
+                    touchMode = touchMode == TouchMode.LONG_PRESS_LOCKED
+                            ? TouchMode.LONG_PRESS_EXTENDING
+                            : TouchMode.DOUBLE_TAP_EXTENDING;
+                    extendInitialWordSelection(x, y);
+                }
+                return;
+
+            case LONG_PRESS_EXTENDING:
+            case DOUBLE_TAP_EXTENDING:
+                extendInitialWordSelection(x, y);
+                return;
+
+            case TAP_PENDING:
+                if (!movedPastSlop(x, y)) return;
+                removeCallbacks(longPressRunnable);
+                touchMode = TouchMode.PANNING;
+                lastTapUpTime = 0L;
+                panTo(x, y);
+                return;
+
+            case PANNING:
+                panTo(x, y);
+                return;
+
+            case IDLE:
+            default:
+                return;
+        }
+    }
+
+    private void panTo(float x, float y) {
+        int nx = Math.max(0, Math.min(
+                getScrollX() + Math.round(lastTouchX - x), maxScrollX()));
+        int ny = Math.max(0, Math.min(
+                getScrollY() + Math.round(lastTouchY - y), maxScrollY()));
+        scrollTo(nx, ny);
+        if (completionPopup != null && completionPopup.isShowing()) {
+            dismissCompletions();
+        }
+    }
+
+    private boolean movedPastSlop(float x, float y) {
+        float dx = x - downX;
+        float dy = y - downY;
+        return dx * dx + dy * dy > touchSlop * touchSlop;
+    }
+
+    private void finishSingleTouch(MotionEvent event, float x, float y,
+                                   boolean cancelled) {
+        removeCallbacks(longPressRunnable);
+        TouchMode finishedMode = touchMode;
+
+        if (!cancelled) {
+            if (finishedMode == TouchMode.TAP_PENDING) {
+                // Immediate caret placement: no double-tap timeout delay.
+                requestFocus();
+                moveCaretTo(offsetForPoint(x, y), false);
+                dismissCompletions();
+                showSoftKeyboard();
+                performClick();
+                lastTapUpTime = event.getEventTime();
+                lastTapX = x;
+                lastTapY = y;
+            } else if (finishedMode == TouchMode.PANNING) {
+                flingFromVelocityTracker();
+                lastTapUpTime = 0L;
+            } else {
+                // Handle/long-press/double-tap selection remains exactly as-is.
+                lastTapUpTime = 0L;
+            }
+        } else {
+            lastTapUpTime = 0L;
+        }
+
+        activeHandle = Handle.NONE;
+        touchMode = TouchMode.IDLE;
+        recycleVelocityTracker();
+        if (getParent() != null) {
+            getParent().requestDisallowInterceptTouchEvent(false);
+        }
+        invalidate();
+    }
+
+    private void flingFromVelocityTracker() {
+        if (velocityTracker == null) return;
+        velocityTracker.computeCurrentVelocity(1000, maximumFlingVelocity);
+        float vx = velocityTracker.getXVelocity();
+        float vy = velocityTracker.getYVelocity();
+        if (Math.abs(vx) < minimumFlingVelocity) vx = 0f;
+        if (Math.abs(vy) < minimumFlingVelocity) vy = 0f;
+        if (vx == 0f && vy == 0f) return;
+        scroller.fling(getScrollX(), getScrollY(),
+                Math.round(-vx), Math.round(-vy),
+                0, maxScrollX(), 0, maxScrollY());
+        postInvalidateOnAnimation();
+    }
+
+    private void showSoftKeyboard() {
+        InputMethodManager imm = (InputMethodManager)
+                getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (imm != null) {
+            imm.showSoftInput(this, 0);
+        }
+    }
+
+    private void addMovement(MotionEvent event) {
+        if (velocityTracker != null) velocityTracker.addMovement(event);
+    }
+
+    private void recycleVelocityTracker() {
+        if (velocityTracker != null) {
+            velocityTracker.recycle();
+            velocityTracker = null;
+        }
+    }
+
+    private void cancelManualTouch(boolean clearTapHistory) {
+        removeCallbacks(longPressRunnable);
+        activeHandle = Handle.NONE;
+        touchMode = TouchMode.IDLE;
+        recycleVelocityTracker();
+        if (clearTapHistory) lastTapUpTime = 0L;
+    }
+
+    /** Marks the current touch sequence as multi-touch. */
+    private void beginMultiTouchSession() {
         suppressSingleFingerGestures = true;
         scaling = true;
         scroller.forceFinished(true);
         dismissCompletions();
-        dispatchGestureCancel(event);
-    }
-
-    /** Feeds ACTION_CANCEL into GestureDetector without mutating {@code event}. */
-    private void dispatchGestureCancel(MotionEvent event) {
-        MotionEvent cancel = MotionEvent.obtain(event);
-        try {
-            cancel.setAction(MotionEvent.ACTION_CANCEL);
-            gestureDetector.onTouchEvent(cancel);
-        } finally {
-            cancel.recycle();
-        }
+        lastTapUpTime = 0L;
     }
 
     @Override
@@ -1450,6 +3007,44 @@ public class CodeEditorView extends View
             scrollTo(scroller.getCurrX(), scroller.getCurrY());
             postInvalidateOnAnimation();
         }
+    }
+
+    /**
+     * Returns the document offset of the glyph box under a touch. Unlike
+     * {@link #offsetForPoint(float, float)}, this never snaps the right half
+     * of the last word character to the following separator — essential for
+     * long-press/double-tap whole-word selection. Always returns a cluster
+     * start so a long-press on an emoji never selects only its high surrogate.
+     */
+    private int characterOffsetForPoint(float viewX, float viewY) {
+        float docX = viewX <= gutterWidth
+                ? 0f
+                : viewX + getScrollX() - gutterWidth;
+        float docY = viewY + getScrollY();
+        int line = Math.max(0, Math.min((int) (docY / lineHeight),
+                document.lineCount() - 1));
+        int lineStart = document.lineStart(line);
+        String content = document.lineContent(line);
+        if (content.isEmpty()) return lineStart;
+
+        float[] xs = buildColumnXs(content, content.length());
+        float targetX = Math.max(0f, docX);
+        int lo = 0;
+        int hi = content.length();
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (xs[mid + 1] <= targetX) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        int column = Math.min(lo, content.length() - 1);
+        // Prefer the cluster start so word selection covers the full glyph
+        // (surrogate pairs, combining marks, shaped ligatures).
+        column = snapColumnToClusterStart(content, column);
+        observeLineWidth(line, xs[content.length()]);
+        return lineStart + column;
     }
 
     private int offsetForPoint(float viewX, float viewY) {
@@ -1484,21 +3079,241 @@ public class CodeEditorView extends View
             float rightDistance = xs[column] - targetX;
             if (leftDistance <= rightDistance) column--;
         }
-        column = snapColumnToCodePointBoundary(content, column);
+        // Collapse duplicate zero-width interior positions onto a real caret
+        // edge (after the cluster for a right-half tap, before for left-half).
+        column = snapColumnToClusterBoundary(content, column, xs, targetX);
         observeLineWidth(line, xs[content.length()]);
         return document.offsetAt(line, column);
     }
 
-    /** Never return a UTF-16 offset between a high and low surrogate. */
-    private static int snapColumnToCodePointBoundary(String text, int column) {
-        if (column > 0 && column < text.length()
-                && Character.isHighSurrogate(text.charAt(column - 1))
-                && Character.isLowSurrogate(text.charAt(column))) {
-            // Use the nearer outside boundary; measured trailing surrogate
-            // positions are commonly equal, so prefer after the code point.
-            return column + 1;
+    /**
+     * Snap a column onto a valid insertion-point boundary for caret placement.
+     * Interior offsets of a shaped cluster share the cluster's trailing x and
+     * must never become caret positions.
+     */
+    private int snapColumnToClusterBoundary(String text, int column,
+                                            float[] xs, float targetX) {
+        if (text.isEmpty()) return 0;
+        column = Math.max(0, Math.min(column, text.length()));
+        if (column == 0 || column == text.length()) return column;
+
+        int start = clusterStartAtOrBefore(text, column);
+        int end = expandColumnToClusterEnd(text, start);
+        if (column > start && column < end) {
+            // Pick the nearer outer edge using measured advances when the
+            // cluster has non-zero width; fall back to mid-index otherwise.
+            float leftX = xs[start];
+            float rightX = xs[end];
+            if (rightX > leftX) {
+                return (targetX - leftX) <= (rightX - targetX) ? start : end;
+            }
+            return (column - start) <= (end - column) ? start : end;
         }
         return column;
+    }
+
+    /** Snap to the start of the cluster that owns {@code column}. */
+    private int snapColumnToClusterStart(String text, int column) {
+        if (text.isEmpty()) return 0;
+        column = Math.max(0, Math.min(column, text.length() - 1));
+        return clusterStartAtOrBefore(text, column);
+    }
+
+    // ------------------------------------------------------------------
+    // Shaped-cluster (grapheme) caret helpers
+    // ------------------------------------------------------------------
+
+    /**
+     * Clamp any document offset onto a valid caret boundary. Uses the line's
+     * shaped cursor positions so surrogate pairs, combining sequences and
+     * ligatures cannot host an interior caret.
+     */
+    private int normalizeCaretOffset(int offset) {
+        if (document == null) return 0;
+        offset = Math.max(0, Math.min(offset, document.length()));
+        if (offset == 0 || offset == document.length()) return offset;
+        int line = document.lineOfOffset(offset);
+        int lineStart = document.lineStart(line);
+        int lineEnd = document.lineEnd(line);
+        if (offset <= lineStart || offset >= lineEnd) return offset;
+        String content = document.lineContent(line);
+        int column = offset - lineStart;
+        int start = clusterStartAtOrBefore(content, column);
+        int end = expandColumnToClusterEnd(content, start);
+        if (column > start && column < end) {
+            // Prefer the end (after the cluster) so a mid-tap lands after the
+            // glyph the user was aiming past — matches typical editor feel.
+            return lineStart + end;
+        }
+        return offset;
+    }
+
+    /** Document offset of the previous valid caret position before {@code offset}. */
+    private int prevClusterOffset(int offset) {
+        if (document == null || offset <= 0) return 0;
+        offset = Math.min(offset, document.length());
+        int line = document.lineOfOffset(Math.max(0, offset - 1));
+        int lineStart = document.lineStart(line);
+        // Crossing a line boundary: land just before the '\n' of the previous
+        // line (i.e. at the end of its content, which is offset - 1 when offset
+        // is a lineStart).
+        if (offset == lineStart) {
+            return offset - 1;
+        }
+        String content = document.lineContent(line);
+        int column = offset - lineStart;
+        int prev = textRunCursor(content, column, Paint.CURSOR_BEFORE);
+        if (prev < 0 || prev >= column) {
+            // Fallback: one code point back.
+            prev = column - 1;
+            if (prev > 0 && Character.isLowSurrogate(content.charAt(prev))
+                    && Character.isHighSurrogate(content.charAt(prev - 1))) {
+                prev--;
+            }
+        }
+        return lineStart + Math.max(0, prev);
+    }
+
+    /** Document offset of the next valid caret position after {@code offset}. */
+    private int nextClusterOffset(int offset) {
+        if (document == null) return 0;
+        offset = Math.max(0, Math.min(offset, document.length()));
+        if (offset >= document.length()) return document.length();
+        int line = document.lineOfOffset(offset);
+        int lineStart = document.lineStart(line);
+        int lineEnd = document.lineEnd(line);
+        // At end of line content, step over the trailing '\n' if any.
+        if (offset >= lineEnd) {
+            return Math.min(document.length(), offset + 1);
+        }
+        String content = document.lineContent(line);
+        int column = offset - lineStart;
+        int next = textRunCursor(content, column, Paint.CURSOR_AFTER);
+        if (next <= column || next > content.length()) {
+            // Fallback: one code point forward.
+            next = column + Character.charCount(content.codePointAt(column));
+        }
+        return lineStart + Math.min(content.length(), next);
+    }
+
+    /**
+     * Expand a document offset forward to the end of the cluster it sits in
+     * (or leave it alone if already a boundary). Used when a range end must
+     * cover whole clusters.
+     */
+    private int expandOffsetToClusterEnd(int offset) {
+        if (document == null) return 0;
+        offset = Math.max(0, Math.min(offset, document.length()));
+        if (offset == 0 || offset >= document.length()) return offset;
+        int line = document.lineOfOffset(offset);
+        int lineStart = document.lineStart(line);
+        int lineEnd = document.lineEnd(line);
+        // offset may be the exclusive end of a line (at '\n'); leave it.
+        if (offset >= lineEnd) return offset;
+        // If offset is mid-cluster, push to the cluster end; if it already is a
+        // boundary, leave it. Detect interior by checking whether offset-1
+        // shares this cluster.
+        String content = document.lineContent(line);
+        int column = offset - lineStart;
+        if (column <= 0) return offset;
+        int startOfPrev = clusterStartAtOrBefore(content, column - 1);
+        int endOfPrev = expandColumnToClusterEnd(content, startOfPrev);
+        if (column < endOfPrev) {
+            return lineStart + endOfPrev;
+        }
+        return offset;
+    }
+
+    /**
+     * For a deletion-range start: if {@code offset} falls inside a cluster,
+     * pull it back to that cluster's start so the whole glyph is included.
+     * Valid caret boundaries are left unchanged.
+     */
+    private int snapRangeStartToCluster(int offset) {
+        if (document == null) return 0;
+        offset = Math.max(0, Math.min(offset, document.length()));
+        if (offset == 0 || offset >= document.length()) return offset;
+        int line = document.lineOfOffset(offset);
+        int lineStart = document.lineStart(line);
+        int lineEnd = document.lineEnd(line);
+        if (offset >= lineEnd) return offset;
+        String content = document.lineContent(line);
+        int column = offset - lineStart;
+        if (column <= 0) return offset;
+        int startOfPrev = clusterStartAtOrBefore(content, column - 1);
+        int endOfPrev = expandColumnToClusterEnd(content, startOfPrev);
+        if (column < endOfPrev) {
+            return lineStart + startOfPrev;
+        }
+        return offset;
+    }
+
+    /** Cluster start at or before a document offset that is known in-range. */
+    private int clusterStartAtOrBefore(int offset) {
+        if (document == null || offset <= 0) return 0;
+        offset = Math.min(offset, document.length());
+        if (offset >= document.length()) {
+            // End-of-document: cluster of the last character.
+            offset = document.length() - 1;
+        }
+        int line = document.lineOfOffset(offset);
+        int lineStart = document.lineStart(line);
+        int lineEnd = document.lineEnd(line);
+        if (offset >= lineEnd) {
+            // Offset on the '\n' — treat as end-of-line content boundary.
+            return lineEnd;
+        }
+        String content = document.lineContent(line);
+        int column = offset - lineStart;
+        return lineStart + clusterStartAtOrBefore(content, column);
+    }
+
+    private int clusterStartAtOrBefore(String text, int column) {
+        if (text.isEmpty()) return 0;
+        column = Math.max(0, Math.min(column, text.length() - 1));
+        // CURSOR_AT_OR_BEFORE: if column is a valid caret pos return it,
+        // otherwise the previous valid one — i.e. the cluster start for an
+        // interior offset, or column itself at a boundary interior to the run.
+        // For a column that IS a cluster start, AT_OR_BEFORE returns it.
+        // For an interior unit, it returns the start.
+        int start = textRunCursor(text, column, Paint.CURSOR_AT_OR_BEFORE);
+        if (start < 0 || start > column) {
+            // Fallback: walk back over low surrogates / combining-ish marks.
+            start = column;
+            if (start > 0 && Character.isLowSurrogate(text.charAt(start))
+                    && Character.isHighSurrogate(text.charAt(start - 1))) {
+                start--;
+            }
+        }
+        return Math.max(0, start);
+    }
+
+    private int expandColumnToClusterEnd(String text, int clusterStart) {
+        if (text.isEmpty()) return 0;
+        clusterStart = Math.max(0, Math.min(clusterStart, text.length()));
+        if (clusterStart >= text.length()) return text.length();
+        int end = textRunCursor(text, clusterStart, Paint.CURSOR_AFTER);
+        if (end <= clusterStart || end > text.length()) {
+            end = clusterStart
+                    + Character.charCount(text.codePointAt(clusterStart));
+        }
+        return Math.min(text.length(), end);
+    }
+
+    /**
+     * Thin wrapper over {@link Paint#getTextRunCursor(CharSequence, int, int,
+     * boolean, int, int)}. Context is always the full line, LTR.
+     */
+    private int textRunCursor(String text, int offset, int cursorOpt) {
+        if (text == null || text.isEmpty()) return 0;
+        offset = Math.max(0, Math.min(offset, text.length()));
+        try {
+            return textPaint.getTextRunCursor(text, 0, text.length(),
+                    false /* LTR */, offset, cursorOpt);
+        } catch (RuntimeException ex) {
+            // Some stub / host environments may not implement the native call.
+            return -1;
+        }
     }
 
     /** Resets the line-width cache; unknown entries are measured lazily. */
@@ -1802,6 +3617,7 @@ public class CodeEditorView extends View
             // visible display frame has settled, then reveal the caret.
             post(this::ensureCaretVisible);
         } else {
+            cancelManualTouch(true);
             dismissCompletions();
         }
         invalidate();
@@ -1834,6 +3650,12 @@ public class CodeEditorView extends View
         if (document != null) {
             document.removeContentListener(widthCacheListener);
             document.addContentListener(widthCacheListener);
+            document.removeContentListener(lspSyncListener);
+            document.addContentListener(lspSyncListener);
+        }
+        // Theme may not have been ready in the constructor (e.g. inflation).
+        if (handleLeftDrawable == null && handleRightDrawable == null) {
+            loadHandleDrawables();
         }
         getViewTreeObserver().addOnGlobalLayoutListener(imeLayoutListener);
         refreshImeVisibleBand();
@@ -1842,12 +3664,24 @@ public class CodeEditorView extends View
     @Override
     protected void onDetachedFromWindow() {
         getViewTreeObserver().removeOnGlobalLayoutListener(imeLayoutListener);
-        if (document != null) document.removeContentListener(widthCacheListener);
+        mainHandler.removeCallbacks(lspChangeDebounce);
+        if (document != null) {
+            document.removeContentListener(widthCacheListener);
+            document.removeContentListener(lspSyncListener);
+        }
+        cancelManualTouch(true);
         super.onDetachedFromWindow();
         removeCallbacks(caretBlink);
         if (completionPopup != null) completionPopup.dismiss();
         if (highlighter != null) highlighter.shutdown();
         if (completionEngine != null) completionEngine.shutdown();
+        // Editor-owned clients (started from grammar/plugin config) die with the
+        // view; externally attached clients are only detached.
+        if (lspOwnedByEditor) {
+            stopLsp();
+        } else if (lspClient != null) {
+            lspClient.removeListener(this);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1943,108 +3777,5 @@ public class CodeEditorView extends View
         charWidth = textPaint.measureText("M");
         gutterPad = charWidth * 0.75f;
         updateGutterWidth();
-    }
-
-    private final class GestureListener extends GestureDetector.SimpleOnGestureListener
-            implements GestureDetector.OnDoubleTapListener {
-
-        @Override
-        public boolean onDown(MotionEvent e) {
-            scroller.forceFinished(true);
-            return true; // must be true for long-press / double-tap / scroll
-        }
-
-        @Override
-        public void onLongPress(MotionEvent e) {
-            if (suppressSingleFingerGestures || scaling) return;
-            if (activeHandle != Handle.NONE) return;
-            requestFocus();
-            selectWordAt(offsetForPoint(e.getX(), e.getY()));
-            dismissCompletions();
-            // Keep the finger's remaining MOVE stream as selection-extend.
-            fingerSelecting = true;
-            activeHandle = Handle.END;
-            doubleTapHandled = true;
-            if (getParent() != null) {
-                getParent().requestDisallowInterceptTouchEvent(true);
-            }
-        }
-
-        @Override
-        public boolean onSingleTapConfirmed(MotionEvent e) {
-            if (suppressSingleFingerGestures || scaling) return true;
-            if (doubleTapHandled || fingerSelecting) return true;
-            requestFocus();
-            moveCaretTo(offsetForPoint(e.getX(), e.getY()), false);
-            dismissCompletions();
-            InputMethodManager imm = (InputMethodManager)
-                    getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
-            if (imm != null) {
-                imm.showSoftInput(CodeEditorView.this, 0);
-            }
-            return true;
-        }
-
-        @Override
-        public boolean onSingleTapUp(MotionEvent e) {
-            // Wait for onSingleTapConfirmed so the first half of a double-tap
-            // does not move the caret.
-            return true;
-        }
-
-        @Override
-        public boolean onDoubleTap(MotionEvent e) {
-            if (suppressSingleFingerGestures || scaling) return true;
-            requestFocus();
-            selectWordAt(offsetForPoint(e.getX(), e.getY()));
-            dismissCompletions();
-            fingerSelecting = true;
-            activeHandle = Handle.END;
-            doubleTapHandled = true;
-            if (getParent() != null) {
-                getParent().requestDisallowInterceptTouchEvent(true);
-            }
-            return true;
-        }
-
-        @Override
-        public boolean onDoubleTapEvent(MotionEvent e) {
-            if (fingerSelecting && e.getActionMasked() == MotionEvent.ACTION_MOVE) {
-                dragSelectionTo(e.getX(), e.getY());
-                return true;
-            }
-            return true;
-        }
-
-        @Override
-        public boolean onScroll(MotionEvent e1, MotionEvent e2,
-                                float dx, float dy) {
-            if (suppressSingleFingerGestures || scaling) return false;
-            // Selection drag is handled in onTouchEvent when fingerSelecting.
-            if (activeHandle != Handle.NONE || fingerSelecting) {
-                dragSelectionTo(e2.getX(), e2.getY());
-                return true;
-            }
-            panning = true;
-            int nx = Math.max(0, Math.min(getScrollX() + Math.round(dx), maxScrollX()));
-            int ny = Math.max(0, Math.min(getScrollY() + Math.round(dy), maxScrollY()));
-            scrollTo(nx, ny);
-            if (completionPopup != null && completionPopup.isShowing()) {
-                dismissCompletions();
-            }
-            return true;
-        }
-
-        @Override
-        public boolean onFling(MotionEvent e1, MotionEvent e2,
-                               float vx, float vy) {
-            if (suppressSingleFingerGestures || scaling) return false;
-            if (activeHandle != Handle.NONE || fingerSelecting) return false;
-            scroller.fling(getScrollX(), getScrollY(),
-                    Math.round(-vx), Math.round(-vy),
-                    0, maxScrollX(), 0, maxScrollY());
-            postInvalidateOnAnimation();
-            return true;
-        }
     }
 }
