@@ -113,6 +113,8 @@ public class CodeEditorView extends View
         HANDLE_DRAG,
         LONG_PRESS_LOCKED,
         LONG_PRESS_EXTENDING,
+        /** Long-press on empty/whitespace: insertion menu (Paste), no selection. */
+        LONG_PRESS_INSERTION,
         DOUBLE_TAP_LOCKED,
         DOUBLE_TAP_EXTENDING
     }
@@ -198,8 +200,18 @@ public class CodeEditorView extends View
     private final Path handleFallbackPath = new Path();
     /** Self-drawn floating selection toolbar (Cut / Copy / Paste / Select all). */
     private boolean selectionToolbarVisible;
-    /** True when the insertion (caret) toolbar is allowed to show. */
+    /**
+     * True when the insertion (caret) toolbar is allowed to show. Independent of
+     * {@link #insertionHandleVisible}: placing the caret shows the handle without
+     * the toolbar; a second tap on the caret enables the toolbar.
+     */
     private boolean insertionToolbarAllowed;
+    /**
+     * True when the middle (insertion) handle should be painted under a bare
+     * caret. Auto-hides after {@link #insertionHandleAutoHideMs}; re-shown after
+     * pan / pinch so the user can locate the caret.
+     */
+    private boolean insertionHandleVisible;
     private final Paint toolbarPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint toolbarTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF toolbarRect = new RectF();
@@ -215,11 +227,26 @@ public class CodeEditorView extends View
     private static final int TB_COPY = 3;
     private static final int TB_PASTE = 4;
     /**
-     * Idle timeout after which the floating toolbar auto-dismisses (selection
-     * is kept). Matches the rough cadence of EditText's floating toolbar.
+     * Default idle timeout after which the floating toolbar auto-dismisses
+     * (selection is kept). Matches the rough cadence of EditText's floating
+     * toolbar. Override with {@link #setSelectionToolbarAutoHideDelay(long)}.
      */
-    private static final long TOOLBAR_AUTO_HIDE_MS = 3000L;
+    public static final long DEFAULT_TOOLBAR_AUTO_HIDE_MS = 3000L;
+    /**
+     * Idle timeout for the floating toolbar, in milliseconds.
+     * {@code <= 0} disables auto-hide (toolbar stays until pan / handle drag /
+     * explicit dismiss / selection collapse).
+     */
+    private long toolbarAutoHideMs = DEFAULT_TOOLBAR_AUTO_HIDE_MS;
     private final Runnable toolbarAutoHideRunnable = this::autoHideSelectionToolbar;
+    /**
+     * Default idle timeout after which the insertion handle auto-hides under a
+     * bare caret. Override with {@link #setInsertionHandleAutoHideDelay(long)}.
+     */
+    public static final long DEFAULT_INSERTION_HANDLE_AUTO_HIDE_MS = 5000L;
+    private long insertionHandleAutoHideMs = DEFAULT_INSERTION_HANDLE_AUTO_HIDE_MS;
+    private final Runnable insertionHandleAutoHideRunnable =
+            this::autoHideInsertionHandle;
 
     // -- LSP ---------------------------------------------------------------
     private LspClient lspClient;
@@ -1052,9 +1079,13 @@ public class CodeEditorView extends View
         invalidate();
         // Typing / paste / cut collapses selection — keep the floating toolbar
         // in sync (dismiss when nothing is selected, refresh otherwise).
+        // Edits also hide the insertion handle; placement gestures re-show it.
         if (!applyingEditableMutation) {
             if (hasSelection()) invalidateSelectionToolbar();
-            else hideSelectionToolbar();
+            else {
+                hideSelectionToolbar();
+                hideInsertionHandle();
+            }
         }
     }
 
@@ -1107,9 +1138,12 @@ public class CodeEditorView extends View
         // drag and keyboard navigation only refresh it when already visible.
         // Explicit gestures (long-press, tap-in-selection) call show themselves.
         if (hasSelection()) {
+            hideInsertionHandle();
             if (selectionToolbarVisible) invalidateSelectionToolbar();
         } else {
             hideSelectionToolbar();
+            // Leave insertionHandleVisible alone — placement callers re-show it;
+            // keyboard caret moves keep the previous handle state until idle hide.
         }
     }
 
@@ -1179,6 +1213,7 @@ public class CodeEditorView extends View
         caret = e;
         activeHandle = Handle.NONE;
         composingStart = composingEnd = -1;
+        hideInsertionHandle();
         ensureCaretVisible();
         resetCaretBlink();
         notifyImeSelection();
@@ -1209,6 +1244,55 @@ public class CodeEditorView extends View
         touchMode = fromDoubleTap
                 ? TouchMode.DOUBLE_TAP_LOCKED
                 : TouchMode.LONG_PRESS_LOCKED;
+    }
+
+    /**
+     * Long-press on empty / whitespace / non-word text: place the caret and
+     * show the insertion toolbar (Paste / Select all) without selecting
+     * anything — matching EditText when the user wants to paste.
+     */
+    private void activateInsertionMenuAt(float viewX, float viewY) {
+        requestFocus();
+        int offset = offsetForPoint(viewX, viewY);
+        // Collapse any previous selection; this is an insertion-point gesture.
+        moveCaretTo(offset, false);
+        showInsertionHandle();
+        insertionToolbarAllowed = true;
+        showSelectionToolbar();
+        dismissCompletions();
+        showSoftKeyboard();
+        try {
+            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+        } catch (Exception ignored) {
+        }
+        if (getParent() != null) {
+            getParent().requestDisallowInterceptTouchEvent(true);
+        }
+        touchMode = TouchMode.LONG_PRESS_INSERTION;
+        lastTapUpTime = 0L;
+    }
+
+    /**
+     * Whether a long-press at {@code offset} should select a word. Word chars
+     * (identifiers) get whole-word select; everything else — whitespace, empty
+     * lines, past EOL, punctuation — opens the insertion/paste menu instead.
+     */
+    private boolean shouldSelectWordOnLongPress(int offset) {
+        if (document == null || document.length() == 0) return false;
+        if (offset < 0) offset = 0;
+        if (offset >= document.length()) {
+            // Past last char (incl. empty trailing line): insertion, not select.
+            return false;
+        }
+        char c = document.charAt(offset);
+        if (isWordChar(c)) return true;
+        // Prefer the character just before the caret when the touch lands on a
+        // boundary after a word (right half of last letter).
+        if (offset > 0) {
+            char prev = document.charAt(offset - 1);
+            if (isWordChar(prev)) return true;
+        }
+        return false;
     }
 
     /** Expands from the initial whole-word selection without shrinking it. */
@@ -1257,7 +1341,8 @@ public class CodeEditorView extends View
     /**
      * Hit-tests selection / insertion handles. Selection handles win over the
      * insertion handle; a bare caret's insertion handle is only tappable while
-     * the insertion toolbar is up so it doesn't steal the first long-press.
+     * {@link #insertionHandleVisible} (or mid-drag) so it doesn't steal the
+     * first long-press before the handle has been revealed.
      *
      * <p>Hit centres use the drawable's <em>hotspot-relative body</em>, not the
      * full bitmap centre — platform handle PNGs carry ~1/4 width of transparent
@@ -1287,7 +1372,7 @@ public class CodeEditorView extends View
             return Handle.NONE;
         }
         if (isFocused() && !scaling
-                && (insertionToolbarAllowed || activeHandle == Handle.INSERT)) {
+                && (insertionHandleVisible || activeHandle == Handle.INSERT)) {
             float bodyW = handleMiddleW > 0 ? handleMiddleW : handleRadius * 1.6f;
             float bodyH = handleMiddleH > 0 ? handleMiddleH : handleRadius * 2f;
             float hitR = Math.max(24f * density, Math.max(bodyW, bodyH) * 0.7f);
@@ -1371,8 +1456,10 @@ public class CodeEditorView extends View
             resetCaretBlink();
             notifyImeSelection();
             invalidate();
-            // Dragging the insertion handle is a move → hide toolbar.
+            // Dragging the insertion handle is a move → hide toolbar, keep handle.
             dismissSelectionToolbar();
+            insertionHandleVisible = true;
+            scheduleInsertionHandleAutoHide();
             return;
         }
 
@@ -2739,9 +2826,9 @@ public class CodeEditorView extends View
             drawHandleAt(canvas, selectionStart(), Handle.START);
             drawHandleAt(canvas, selectionEnd(), Handle.END);
         } else if (isFocused() && !scaling
-                && (insertionToolbarAllowed || activeHandle == Handle.INSERT)) {
-            // EditText reveals the middle handle with the insertion toolbar
-            // (tap caret / long-press empty) or while the user is dragging it.
+                && (insertionHandleVisible || activeHandle == Handle.INSERT)) {
+            // Middle handle under a bare caret — independent of the insertion
+            // toolbar so placing the caret still reveals a drag target.
             drawHandleAt(canvas, caret, Handle.INSERT);
         }
     }
@@ -3010,6 +3097,100 @@ public class CodeEditorView extends View
     // Selection toolbar (self-drawn Cut / Copy / Paste / Select all)
     // ------------------------------------------------------------------
 
+    /**
+     * Sets how long the floating selection toolbar stays visible with no
+     * interaction before auto-dismissing (selection is kept).
+     *
+     * @param delayMs milliseconds of idle time before hide; {@code <= 0}
+     *                disables auto-hide. Default is
+     *                {@link #DEFAULT_TOOLBAR_AUTO_HIDE_MS} (3 s).
+     */
+    public void setSelectionToolbarAutoHideDelay(long delayMs) {
+        toolbarAutoHideMs = delayMs;
+        if (selectionToolbarVisible) {
+            // Apply immediately: reschedule with the new delay, or cancel if
+            // auto-hide was just disabled.
+            scheduleToolbarAutoHide();
+        }
+    }
+
+    /**
+     * Current floating-toolbar idle auto-hide delay in milliseconds.
+     * {@code <= 0} means auto-hide is disabled.
+     */
+    public long getSelectionToolbarAutoHideDelay() {
+        return toolbarAutoHideMs;
+    }
+
+    /**
+     * Sets how long the insertion (middle) handle stays visible under a bare
+     * caret with no interaction before auto-hiding.
+     *
+     * @param delayMs milliseconds of idle time before hide; {@code <= 0}
+     *                disables auto-hide. Default is
+     *                {@link #DEFAULT_INSERTION_HANDLE_AUTO_HIDE_MS} (5 s).
+     */
+    public void setInsertionHandleAutoHideDelay(long delayMs) {
+        insertionHandleAutoHideMs = delayMs;
+        if (insertionHandleVisible) {
+            scheduleInsertionHandleAutoHide();
+        }
+    }
+
+    /**
+     * Current insertion-handle idle auto-hide delay in milliseconds.
+     * {@code <= 0} means auto-hide is disabled.
+     */
+    public long getInsertionHandleAutoHideDelay() {
+        return insertionHandleAutoHideMs;
+    }
+
+    /**
+     * Shows the middle insertion handle under the bare caret and (re)starts its
+     * idle auto-hide timer. No-op while a range is selected (selection handles
+     * take over). Used after caret placement and after pan / pinch ends so the
+     * user can locate the caret.
+     */
+    private void showInsertionHandle() {
+        if (document == null || hasSelection() || !isFocused()) {
+            hideInsertionHandle();
+            return;
+        }
+        if (!insertionHandleVisible) {
+            insertionHandleVisible = true;
+            invalidate();
+        }
+        scheduleInsertionHandleAutoHide();
+    }
+
+    private void hideInsertionHandle() {
+        cancelInsertionHandleAutoHide();
+        if (insertionHandleVisible) {
+            insertionHandleVisible = false;
+            invalidate();
+        }
+    }
+
+    private void autoHideInsertionHandle() {
+        // Keep the handle while the user is actively dragging it.
+        if (activeHandle == Handle.INSERT) {
+            scheduleInsertionHandleAutoHide();
+            return;
+        }
+        hideInsertionHandle();
+    }
+
+    private void scheduleInsertionHandleAutoHide() {
+        cancelInsertionHandleAutoHide();
+        if (insertionHandleVisible && insertionHandleAutoHideMs > 0L) {
+            postDelayed(insertionHandleAutoHideRunnable, insertionHandleAutoHideMs);
+        }
+    }
+
+    private void cancelInsertionHandleAutoHide() {
+        removeCallbacks(insertionHandleAutoHideRunnable);
+    }
+
     private void showSelectionToolbar() {
         if (!isAttachedToWindow() || !isFocused()) {
             hideSelectionToolbar();
@@ -3051,7 +3232,8 @@ public class CodeEditorView extends View
     /**
      * Hides the floating toolbar without clearing selection. Used when the user
      * pans, drags a handle, or the idle timer fires — the selection stays so a
-     * later tap on it can re-show the bar.
+     * later tap on it can re-show the bar. Does <em>not</em> hide the insertion
+     * handle; call {@link #hideInsertionHandle()} separately when needed.
      */
     private void dismissSelectionToolbar() {
         cancelToolbarAutoHide();
@@ -3080,8 +3262,8 @@ public class CodeEditorView extends View
 
     private void scheduleToolbarAutoHide() {
         cancelToolbarAutoHide();
-        if (selectionToolbarVisible) {
-            postDelayed(toolbarAutoHideRunnable, TOOLBAR_AUTO_HIDE_MS);
+        if (selectionToolbarVisible && toolbarAutoHideMs > 0L) {
+            postDelayed(toolbarAutoHideRunnable, toolbarAutoHideMs);
         }
     }
 
@@ -3586,6 +3768,12 @@ public class CodeEditorView extends View
                     getParent().requestDisallowInterceptTouchEvent(false);
                 }
                 resetCaretBlink();
+                // Pinch finished — re-show the insertion handle so the user
+                // can locate the caret after the viewport changed.
+                if (action == MotionEvent.ACTION_UP
+                        && !hasSelection() && isFocused()) {
+                    showInsertionHandle();
+                }
             }
             return true;
         }
@@ -3624,8 +3812,14 @@ public class CodeEditorView extends View
                 || scaling || document == null) {
             return;
         }
-        activateWordSelectionAt(downX, downY, false);
-        touchMode = TouchMode.LONG_PRESS_LOCKED;
+        // Long-press is not always "select word" — empty lines / whitespace /
+        // past EOL are the usual place users long-press to paste.
+        int probe = characterOffsetForPoint(downX, downY);
+        if (shouldSelectWordOnLongPress(probe)) {
+            activateWordSelectionAt(downX, downY, false);
+        } else {
+            activateInsertionMenuAt(downX, downY);
+        }
     }
 
     private void beginSingleTouch(MotionEvent event, float x, float y) {
@@ -3736,6 +3930,17 @@ public class CodeEditorView extends View
                 extendInitialWordSelection(x, y);
                 return;
 
+            case LONG_PRESS_INSERTION:
+                // Finger still down after empty long-press: slide away → pan
+                // (and drop the paste menu); stay put → keep the menu on UP.
+                if (movedPastSlop(x, y)) {
+                    touchMode = TouchMode.PANNING;
+                    lastTapUpTime = 0L;
+                    dismissSelectionToolbar();
+                    panTo(x, y);
+                }
+                return;
+
             case TAP_PENDING:
                 if (!movedPastSlop(x, y)) return;
                 removeCallbacks(longPressRunnable);
@@ -3793,26 +3998,51 @@ public class CodeEditorView extends View
                     showSoftKeyboard();
                     performClick();
                     lastTapUpTime = 0L;
-                } else {
-                    // Immediate caret placement: no double-tap timeout delay.
-                    moveCaretTo(offset, false);
-                    dismissCompletions();
-                    showSoftKeyboard();
-                    // EditText reveals Paste/Select-all on a focused caret tap.
+                } else if (!hasSelection() && offset == caret) {
+                    // Second tap on the already-placed caret: wake the
+                    // insertion toolbar (Paste / Select all). First placement
+                    // never auto-shows it. Keep the insertion handle visible.
+                    showInsertionHandle();
                     insertionToolbarAllowed = true;
                     showSelectionToolbar();
+                    dismissCompletions();
+                    showSoftKeyboard();
+                    performClick();
+                    lastTapUpTime = 0L;
+                } else {
+                    // Place caret + insertion handle only — no toolbar.
+                    // User re-taps the caret (or long-presses empty space)
+                    // to bring Paste/Select all.
+                    moveCaretTo(offset, false);
+                    showInsertionHandle();
+                    dismissCompletions();
+                    showSoftKeyboard();
                     performClick();
                     lastTapUpTime = event.getEventTime();
                     lastTapX = x;
                     lastTapY = y;
                 }
             } else if (finishedMode == TouchMode.PANNING) {
-                // Pan already dismissed the bar; do not re-show.
+                // Pan already dismissed the toolbar; re-show the insertion
+                // handle so the user can locate the caret after scrolling.
                 flingFromVelocityTracker();
+                if (!hasSelection() && isFocused()) {
+                    showInsertionHandle();
+                }
                 lastTapUpTime = 0L;
             } else if (finishedMode == TouchMode.HANDLE_DRAG) {
-                // Handle drag dismissed the bar; leave it hidden until the
-                // user taps the selection again.
+                // Selection-handle drag dismissed the bar; leave it hidden.
+                // Insertion-handle drag kept the handle — refresh its timer.
+                if (!hasSelection() && isFocused()) {
+                    showInsertionHandle();
+                }
+                lastTapUpTime = 0L;
+            } else if (finishedMode == TouchMode.LONG_PRESS_INSERTION) {
+                // Insertion long-press already placed the caret and showed
+                // Paste/Select-all; refresh so the bar tracks the final point.
+                showInsertionHandle();
+                insertionToolbarAllowed = true;
+                showSelectionToolbar();
                 lastTapUpTime = 0L;
             } else if (finishedMode == TouchMode.LONG_PRESS_LOCKED
                     || finishedMode == TouchMode.LONG_PRESS_EXTENDING
@@ -3821,6 +4051,7 @@ public class CodeEditorView extends View
                 // Fresh selection from long-press / double-tap: show toolbar.
                 // (selectWordAt already showed it; extending dismissed it —
                 // re-show on finger-up so the final range gets a bar.)
+                hideInsertionHandle();
                 if (hasSelection()) showSelectionToolbar();
                 lastTapUpTime = 0L;
             } else {
@@ -3904,6 +4135,10 @@ public class CodeEditorView extends View
         if (scroller.computeScrollOffset()) {
             scrollTo(scroller.getCurrX(), scroller.getCurrY());
             postInvalidateOnAnimation();
+            if (scroller.isFinished() && !hasSelection() && isFocused()) {
+                // Fling settled — re-show the insertion handle for locating.
+                showInsertionHandle();
+            }
         }
     }
 
@@ -4565,12 +4800,14 @@ public class CodeEditorView extends View
         getViewTreeObserver().removeOnGlobalLayoutListener(imeLayoutListener);
         mainHandler.removeCallbacks(lspChangeDebounce);
         cancelToolbarAutoHide();
+        cancelInsertionHandleAutoHide();
         if (document != null) {
             document.removeContentListener(widthCacheListener);
             document.removeContentListener(lspSyncListener);
         }
         cancelManualTouch(true);
         hideSelectionToolbar();
+        hideInsertionHandle();
         super.onDetachedFromWindow();
         removeCallbacks(caretBlink);
         if (completionPopup != null) completionPopup.dismiss();

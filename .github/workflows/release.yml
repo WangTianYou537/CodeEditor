@@ -1,0 +1,107 @@
+name: Release
+
+# Trigger: push a version tag (v1.2.3) OR manual workflow_dispatch with version.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without leading v (e.g. 1.2.3)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark GitHub Release as prerelease"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    name: Build, publish Maven, create GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            V="${{ inputs.version }}"
+          else
+            # refs/tags/v1.2.3 → 1.2.3
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          if [[ ! "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$ ]]; then
+            echo "Invalid version: $V" >&2
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=v$V" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $V"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cache android.jar
+        id: cache-android
+        uses: actions/cache@v4
+        with:
+          path: android-sdk/platforms/android-35/android.jar
+          key: android-jar-platform-35_r01
+
+      - name: Fetch android.jar
+        if: steps.cache-android.outputs.cache-hit != 'true'
+        run: ./scripts/fetch-android-platform.sh 35
+
+      - name: Build JAR + sources + POM
+        run: ./scripts/build-jar.sh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+
+      - name: Publish to GitHub Packages (Maven)
+        run: ./scripts/publish-github-packages.sh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+
+      - name: Ensure git tag exists (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: CodeEditor ${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
+          files: |
+            dist/codeeditor-${{ steps.ver.outputs.version }}.jar
+            dist/codeeditor-${{ steps.ver.outputs.version }}-sources.jar
+            dist/codeeditor-${{ steps.ver.outputs.version }}.pom
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

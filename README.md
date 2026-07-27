@@ -94,6 +94,11 @@ editor.setText(goSource);
 
 editor.undo(); editor.redo();
 String text = editor.getText();
+
+// Floating selection toolbar idle auto-hide (default 3000 ms; <=0 = never).
+editor.setSelectionToolbarAutoHideDelay(5000L);
+// Insertion handle idle auto-hide (default 5000 ms; <=0 = never).
+editor.setInsertionHandleAutoHideDelay(5000L);
 ```
 
 ## Language Server Protocol (LSP)
@@ -194,15 +199,33 @@ Middle`) with AOSP hotspot placement so Material teardrops sit flush against
 the caret. Dragging past the opposite edge **swaps handle roles** without
 walking the fixed edge.
 
+### Insertion handle (bare caret)
+
+- **Shown on caret placement** (no toolbar) so the user can drag the caret.
+- **Auto-hides after idle** (default 5 s; `setInsertionHandleAutoHideDelay(ms)`,
+  `<= 0` disables).
+- **Re-shown after pan / fling / pinch** finishes, so the caret stays locatable
+  after viewport changes.
+- Independent of the floating toolbar: first tap places caret + handle; second
+  tap on the caret wakes Paste / Select all.
+
+### Floating toolbar
+
 A self-drawn floating toolbar (Cut / Copy / Paste / Select all) replaces
 `ActionMode`:
 
 - Pinned in **view coordinates** above the caret / selection midpoint so it
   tracks the on-screen anchor while the document scrolls underneath.
+- **Not shown on first caret placement** — second tap on the caret, tap inside
+  a selection, or long-press empty space (paste menu) shows it.
 - **Hidden on pan / handle drag / pinch**, selection kept.
 - **Re-shown by tapping inside the selection** (does not collapse the range).
-- **Auto-hides after 3 s** of idle; tapping a toolbar item resets the timer.
+- **Auto-hides after idle** (default 3 s; configurable via
+  `setSelectionToolbarAutoHideDelay(ms)`, `<= 0` disables); tapping a toolbar
+  item resets the timer.
 - Hidden while the anchor is fully off-screen.
+- Long-press on a **word** selects it + shows the selection toolbar; long-press
+  on **empty / whitespace** places the caret and shows Paste / Select all.
 
 ## IME (English predictive input)
 
@@ -268,7 +291,90 @@ export ANDROID_JAR=$ANDROID_HOME/platforms/android-35/android.jar
 ./build.sh
 ```
 
-Step by step without the script:
+### Package as JAR
+
+```bash
+# Runs core tests, compiles the library, writes dist/:
+#   codeeditor-<ver>.jar
+#   codeeditor-<ver>-sources.jar
+#   codeeditor-<ver>.pom
+#   maven-repo/   (local Maven layout)
+./scripts/build-jar.sh
+
+# Pin a version (otherwise VERSION file → git tag → 0.1.0-SNAPSHOT):
+VERSION=1.2.3 ./scripts/build-jar.sh
+SKIP_TESTS=1 ./scripts/build-jar.sh
+```
+
+Coordinates: **`cn.wty5:codeeditor:<version>`**.
+
+Local Gradle install from the generated repo layout:
+
+```kotlin
+repositories {
+    maven { url = uri("/path/to/CodeEditor/dist/maven-repo") }
+}
+dependencies {
+    implementation("cn.wty5:codeeditor:0.1.0")
+}
+// or
+implementation(files("path/to/codeeditor-0.1.0.jar"))
+```
+
+### Publish & release
+
+GitHub Actions workflows (no Gradle required):
+
+| Workflow | Trigger | What it does |
+|---|---|---|
+| **CI** (`.github/workflows/ci.yml`) | push / PR to `main` | fetch `android.jar`, run tests, build JAR, upload artifact |
+| **Release** (`.github/workflows/release.yml`) | tag `v*.*.*` or manual dispatch | build JAR, publish to **GitHub Packages** (Maven), create GitHub Release with jar/sources/pom |
+
+Release from a tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+# → Release workflow builds, publishes Maven package, opens GitHub Release
+```
+
+Or **Actions → Release → Run workflow** and enter `0.1.0`.
+
+Manual publish (needs a PAT with `write:packages`):
+
+```bash
+VERSION=0.1.0 ./scripts/build-jar.sh
+GITHUB_TOKEN=ghp_... ./scripts/publish-github-packages.sh
+```
+
+### Consume from GitHub Packages
+
+```kotlin
+// settings.gradle.kts / build.gradle.kts
+repositories {
+    maven {
+        url = uri("https://maven.pkg.github.com/WangTianYou537/CodeEditor")
+        credentials {
+            username = project.findProperty("gpr.user") as String?
+                ?: System.getenv("GITHUB_ACTOR")
+            password = project.findProperty("gpr.key") as String?
+                ?: System.getenv("GITHUB_TOKEN")
+        }
+    }
+}
+dependencies {
+    implementation("cn.wty5:codeeditor:0.1.0")
+}
+```
+
+`~/.gradle/gradle.properties`:
+
+```properties
+gpr.user=YOUR_GITHUB_USERNAME
+gpr.key=YOUR_GITHUB_PAT   # read:packages (and repo if private)
+```
+
+### Step by step without the scripts
 
 ```bash
 # 1. Core (no Android):
@@ -282,6 +388,9 @@ java -cp build/core-classes LspTest
 # 2. Full tree vs platform jar:
 javac --release 17 -cp "$ANDROID_JAR" -d build/android-classes \
   $(find src -name '*.java')
+
+# 3. JAR:
+jar cf dist/codeeditor.jar -C build/android-classes .
 ```
 
 ## Layout
@@ -299,8 +408,13 @@ grammars/                      same files at project root (dev / loadFromDirecto
 test/                          CoreTest, GrammarTest, LspTest (plain JDK)
 scripts/fetch-android-platform.sh
 scripts/build-demo-apk.sh
+scripts/build-jar.sh           library JAR + sources + POM + local Maven repo
+scripts/publish-github-packages.sh
+.github/workflows/ci.yml       test + package on push/PR
+.github/workflows/release.yml  tag → GitHub Release + GitHub Packages
+VERSION                        default package version (overridden by tag / env)
 build.sh                       compile + test entry point
 android-sdk/                   local only (gitignored) — platform android.jar
 build/                         local only (gitignored) — class output
-dist/                          local only (gitignored) — demo APK
+dist/                          local only (gitignored) — JAR / demo APK / maven-repo
 ```

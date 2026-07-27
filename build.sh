@@ -43,3 +43,6 @@ javac --release 17 -cp "$ANDROID_JAR" -d "$OUT" @/tmp/ce-all-src.txt
 mkdir -p "$OUT/grammars" && cp "$ROOT/grammars/"*.json "$OUT/grammars/"
 
 echo "OK — classes in $OUT ($(find "$OUT" -name '*.class' | wc -l) class files)"
+echo
+echo "Package a library JAR with:  ./scripts/build-jar.sh"
+echo "Demo APK with:               ./scripts/build-demo-apk.sh"
