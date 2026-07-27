@@ -1,10 +1,16 @@
 package cn.wty5.editor.view;
 
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.res.Resources;
 import android.content.res.TypedArray;
 import android.graphics.Canvas;
+import android.graphics.Matrix;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.Rect;
+import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.os.Handler;
@@ -19,6 +25,7 @@ import android.view.ScaleGestureDetector;
 import android.view.VelocityTracker;
 import android.view.View;
 import android.view.ViewConfiguration;
+import android.view.inputmethod.CursorAnchorInfo;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.ExtractedText;
 import android.view.inputmethod.ExtractedTextRequest;
@@ -82,9 +89,21 @@ public class CodeEditorView extends View
     private int selectionAnchor = -1; // -1 = no selection
     private boolean caretVisible = true;
 
-    /** Which selection handle is being dragged, if any. */
-    private enum Handle { NONE, START, END }
+    /** Which selection / insertion handle is being dragged, if any. */
+    private enum Handle { NONE, START, END, INSERT }
     private Handle activeHandle = Handle.NONE;
+    /**
+     * While dragging START/END, the opposite selection edge is frozen here so
+     * crossing the other handle cannot "walk" it (AOSP clamps rather than
+     * mutating both ends).
+     */
+    private int handleDragFixedOffset = -1;
+    /**
+     * Added to the finger Y when mapping a handle drag to a document offset.
+     * Handles hang below the line, so without this the first touch lands on
+     * the next line and the selection jumps.
+     */
+    private float handleDragMapYAdjust;
 
     /** Explicit single-pointer interaction state; no GestureDetector latency. */
     private enum TouchMode {
@@ -130,6 +149,17 @@ public class CodeEditorView extends View
     private boolean extractedMonitor;
     /** Nested IME batch-edit depth (keeps multi-step commits as one undo). */
     private int imeBatchDepth;
+    /** Active InputConnection; kept so external edits can resync its Editable. */
+    private EditorInputConnection activeInputConnection;
+    /** Cursor-anchor monitoring requested by the IME. */
+    private boolean cursorAnchorMonitor;
+    private final Matrix cursorAnchorMatrix = new Matrix();
+    private final int[] viewLocationOnScreen = new int[2];
+    /**
+     * True while applying IME Editable → document mutations so we don't
+     * clear composing / bounce-sync back into the Editable.
+     */
+    private boolean applyingEditableMutation;
 
     // -- metrics ---------------------------------------------------------
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -153,14 +183,43 @@ public class CodeEditorView extends View
 
     /**
      * Native Android text-select handles resolved from the activity theme
-     * ({@code textSelectHandleLeft/Right}). Drawn directly — no custom path.
+     * ({@code textSelectHandleLeft/Right/Middle}), with system-resource
+     * fallback so DeviceDefault hosts still get EditText-style teardrops.
      */
     private Drawable handleLeftDrawable;
     private Drawable handleRightDrawable;
+    private Drawable handleMiddleDrawable;
     private int handleIntrinsicW;
     private int handleIntrinsicH;
+    private int handleMiddleW;
+    private int handleMiddleH;
     /** Fallback body radius used only when theme drawables are unavailable. */
     private float handleRadius;
+    private final Path handleFallbackPath = new Path();
+    /** Self-drawn floating selection toolbar (Cut / Copy / Paste / Select all). */
+    private boolean selectionToolbarVisible;
+    /** True when the insertion (caret) toolbar is allowed to show. */
+    private boolean insertionToolbarAllowed;
+    private final Paint toolbarPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint toolbarTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final RectF toolbarRect = new RectF();
+    private final Path toolbarArrow = new Path();
+    /** Visible item ids in left-to-right order for the current toolbar frame. */
+    private final int[] toolbarItemIds = new int[4];
+    private int toolbarItemCount;
+    private float toolbarItemWidth;
+    private float toolbarHeight;
+    private float toolbarArrowSize;
+    private static final int TB_SELECT_ALL = 1;
+    private static final int TB_CUT = 2;
+    private static final int TB_COPY = 3;
+    private static final int TB_PASTE = 4;
+    /**
+     * Idle timeout after which the floating toolbar auto-dismisses (selection
+     * is kept). Matches the rough cadence of EditText's floating toolbar.
+     */
+    private static final long TOOLBAR_AUTO_HIDE_MS = 3000L;
+    private final Runnable toolbarAutoHideRunnable = this::autoHideSelectionToolbar;
 
     // -- LSP ---------------------------------------------------------------
     private LspClient lspClient;
@@ -286,6 +345,12 @@ public class CodeEditorView extends View
         diagnosticPaint.setStyle(Paint.Style.STROKE);
         diagnosticPaint.setStrokeWidth(Math.max(1.5f, 1.5f * density));
         diagnosticPaint.setStrokeCap(Paint.Cap.ROUND);
+        toolbarPaint.setStyle(Paint.Style.FILL);
+        toolbarTextPaint.setTypeface(Typeface.DEFAULT);
+        toolbarTextPaint.setTextAlign(Paint.Align.CENTER);
+        toolbarTextPaint.setSubpixelText(true);
+        toolbarHeight = 40f * density;
+        toolbarArrowSize = 7f * density;
         // Fallback size if the theme has no handle drawables.
         handleRadius = 11f * density;
         loadHandleDrawables();
@@ -970,15 +1035,27 @@ public class CodeEditorView extends View
     private void afterEdit() {
         // Non-IME edits (hardware keys, paste via our own API, undo) clear any
         // stale composing region so the IME cannot keep extending it.
-        if (imeBatchDepth == 0) {
+        if (imeBatchDepth == 0 && !applyingEditableMutation) {
             composingStart = composingEnd = -1;
         }
         clampCaret();
         updateGutterWidth();
         ensureCaretVisible();
         resetCaretBlink();
+        // Content first: rebuild Editable text if the piece table changed.
+        // notifyImeSelection then updates Selection/COMPOSING spans (and is a
+        // no-op for the text body when lengths already match).
+        if (!applyingEditableMutation && activeInputConnection != null) {
+            activeInputConnection.syncFromDocument();
+        }
         notifyImeSelection();
         invalidate();
+        // Typing / paste / cut collapses selection — keep the floating toolbar
+        // in sync (dismiss when nothing is selected, refresh otherwise).
+        if (!applyingEditableMutation) {
+            if (hasSelection()) invalidateSelectionToolbar();
+            else hideSelectionToolbar();
+        }
     }
 
     private void clampCaret() {
@@ -1026,6 +1103,14 @@ public class CodeEditorView extends View
         resetCaretBlink();
         notifyImeSelection();
         invalidate();
+        // Never auto-pop the toolbar on caret/selection moves — pan, handle
+        // drag and keyboard navigation only refresh it when already visible.
+        // Explicit gestures (long-press, tap-in-selection) call show themselves.
+        if (hasSelection()) {
+            if (selectionToolbarVisible) invalidateSelectionToolbar();
+        } else {
+            hideSelectionToolbar();
+        }
     }
 
     private void moveCaretVertically(int lineDelta, boolean extend) {
@@ -1098,6 +1183,7 @@ public class CodeEditorView extends View
         resetCaretBlink();
         notifyImeSelection();
         invalidate();
+        showSelectionToolbar();
     }
 
     /**
@@ -1148,6 +1234,9 @@ public class CodeEditorView extends View
         resetCaretBlink();
         notifyImeSelection();
         invalidate();
+        // Extending the selection is a move — hide the bar; user re-taps the
+        // selection to bring it back.
+        dismissSelectionToolbar();
     }
 
     private static boolean isWordChar(char c) {
@@ -1166,44 +1255,90 @@ public class CodeEditorView extends View
     }
 
     /**
-     * Hit-tests the start / end selection handles. Only active while there
-     * is a real selection — a bare caret must NOT steal taps that should
-     * become double-tap / long-press word selects.
+     * Hit-tests selection / insertion handles. Selection handles win over the
+     * insertion handle; a bare caret's insertion handle is only tappable while
+     * the insertion toolbar is up so it doesn't steal the first long-press.
+     *
+     * <p>Hit centres use the drawable's <em>hotspot-relative body</em>, not the
+     * full bitmap centre — platform handle PNGs carry ~1/4 width of transparent
+     * padding on each side, so a full-bitmap centre would sit far outside the
+     * painted teardrop.
      */
     private Handle hitTestHandle(float viewX, float viewY) {
-        if (!hasSelection() || document == null
-                || lineHeight <= 0f || charWidth <= 0f) {
+        if (document == null || lineHeight <= 0f || charWidth <= 0f) {
             return Handle.NONE;
         }
-        // Body is offset from the tip; give a generous hit target.
-        float hitR = handleRadius * 2.8f;
-        float hitR2 = hitR * hitR;
-        float[] start = handleViewPos(selectionStart(), true);
-        float[] end = handleViewPos(selectionEnd(), false);
-        float ds = dist2(viewX, viewY, start[0], start[1]);
-        float de = dist2(viewX, viewY, end[0], end[1]);
-        if (ds <= hitR2 || de <= hitR2) {
-            return ds <= de ? Handle.START : Handle.END;
+        if (hasSelection()) {
+            // Radius ≈ half the painted body (hotspot is at 1/4 or 3/4 of width,
+            // so the opaque body spans ~half the intrinsic width).
+            float bodyW = handleIntrinsicW > 0 ? handleIntrinsicW * 0.5f
+                    : handleRadius * 2f;
+            float bodyH = handleIntrinsicH > 0 ? handleIntrinsicH
+                    : handleRadius * 2f;
+            float hitR = Math.max(24f * density, Math.max(bodyW, bodyH) * 0.65f);
+            float hitR2 = hitR * hitR;
+            float[] start = handleViewPos(selectionStart(), Handle.START);
+            float[] end = handleViewPos(selectionEnd(), Handle.END);
+            float ds = dist2(viewX, viewY, start[0], start[1]);
+            float de = dist2(viewX, viewY, end[0], end[1]);
+            if (ds <= hitR2 || de <= hitR2) {
+                return ds <= de ? Handle.START : Handle.END;
+            }
+            return Handle.NONE;
+        }
+        if (isFocused() && !scaling
+                && (insertionToolbarAllowed || activeHandle == Handle.INSERT)) {
+            float bodyW = handleMiddleW > 0 ? handleMiddleW : handleRadius * 1.6f;
+            float bodyH = handleMiddleH > 0 ? handleMiddleH : handleRadius * 2f;
+            float hitR = Math.max(24f * density, Math.max(bodyW, bodyH) * 0.7f);
+            float[] mid = handleViewPos(caret, Handle.INSERT);
+            if (dist2(viewX, viewY, mid[0], mid[1]) <= hitR * hitR) {
+                return Handle.INSERT;
+            }
         }
         return Handle.NONE;
     }
 
     /**
-     * View-local centre of the handle body for hit-testing. Native left/right
-     * drawables hang BELOW the line; the tip sits on the selection edge and
-     * the body is centred in the drawable bounds.
+     * View-local centre of the <em>painted</em> handle body for hit-testing.
+     * Uses the same AOSP hotspot placement as {@link #drawHandleAt}:
+     * <ul>
+     *   <li>START (LTR left drawable): hotspotX = 3/4 width</li>
+     *   <li>END   (LTR right drawable): hotspotX = 1/4 width</li>
+     *   <li>INSERT (middle drawable): hotspotX = 1/2 width</li>
+     * </ul>
+     * Body centre is then roughly the midpoint of the opaque region, which for
+     * Material handles sits near the bitmap centre.
      */
-    private float[] handleViewPos(int offset, boolean startHandle) {
+    private float[] handleViewPos(int offset, Handle which) {
         int line = document.lineOfOffset(offset);
         float tipX = contentXForOffset(offset) - getScrollX();
         float tipY = (line + 1) * lineHeight - getScrollY();
-        float w = handleIntrinsicW > 0 ? handleIntrinsicW : handleRadius * 2f;
-        float h = handleIntrinsicH > 0 ? handleIntrinsicH : handleRadius * 2f;
-        // Left handle: tip is the top-RIGHT of the bitmap.
-        // Right handle: tip is the top-LEFT of the bitmap.
-        float left = startHandle ? tipX - w : tipX;
-        float top = tipY;
-        return new float[]{left + w * 0.5f, top + h * 0.5f};
+        float w;
+        float h;
+        float hotspotX;
+        if (which == Handle.INSERT) {
+            w = handleMiddleW > 0 ? handleMiddleW
+                    : (handleIntrinsicW > 0 ? handleIntrinsicW * 0.55f
+                    : handleRadius * 1.6f);
+            h = handleMiddleH > 0 ? handleMiddleH
+                    : (handleIntrinsicH > 0 ? handleIntrinsicH
+                    : handleRadius * 2f);
+            hotspotX = w * 0.5f;
+        } else if (which == Handle.START) {
+            w = handleIntrinsicW > 0 ? handleIntrinsicW : handleRadius * 2f;
+            h = handleIntrinsicH > 0 ? handleIntrinsicH : handleRadius * 2f;
+            // AOSP SelectionHandleView for start handle, LTR: 3/4 width.
+            hotspotX = w * 0.75f;
+        } else {
+            w = handleIntrinsicW > 0 ? handleIntrinsicW : handleRadius * 2f;
+            h = handleIntrinsicH > 0 ? handleIntrinsicH : handleRadius * 2f;
+            // AOSP SelectionHandleView for end handle, LTR: 1/4 width.
+            hotspotX = w * 0.25f;
+        }
+        // Drawable left edge so the hotspot lands on tipX; body centre ≈ mid.
+        float left = tipX - hotspotX;
+        return new float[]{left + w * 0.5f, tipY + h * 0.5f};
     }
 
     private static float dist2(float x1, float y1, float x2, float y2) {
@@ -1213,50 +1348,62 @@ public class CodeEditorView extends View
     }
 
     /**
-     * Moves the dragged end of the selection to the document offset under
-     * {@code (viewX, viewY)}. Keeps anchor as the fixed end; swaps roles
-     * transparently when the finger crosses.
+     * Moves the dragged end of the selection (or the insertion caret).
+     * Finger Y is adjusted by {@link #handleDragMapYAdjust} so a touch on the
+     * body below the line still maps into the correct line.
+     *
+     * <p>{@link #handleDragFixedOffset} is the edge NOT under the finger and
+     * never moves during this gesture. When the finger crosses it we swap
+     * {@link #activeHandle} (START ↔ END) so drawing/hit-testing stay correct,
+     * but the fixed edge itself is unchanged — so dragging past and back does
+     * not "walk" the other handle.
      */
     private void dragSelectionTo(float viewX, float viewY) {
         if (document == null) return;
-        // offsetForPoint already snaps to a cluster boundary.
-        int offset = offsetForPoint(viewX, viewY);
+        float mapY = viewY + handleDragMapYAdjust;
+        int offset = normalizeCaretOffset(offsetForPoint(viewX, mapY));
 
-        if (activeHandle == Handle.START) {
-            int end = Math.max(caret, selectionAnchor);
-            if (offset >= end) {
-                // Crossed the end — pin start at the previous cluster and flip.
-                selectionAnchor = prevClusterOffset(end);
-                caret = offset;
-                activeHandle = Handle.END;
-            } else {
-                selectionAnchor = offset;
-                caret = end;
-            }
-        } else { // END handle drag
-            int start = selectionAnchor >= 0
-                    ? Math.min(caret, selectionAnchor)
-                    : caret;
-            if (selectionAnchor < 0) {
-                selectionAnchor = caret;
-                start = caret;
-            }
-            if (offset <= start) {
-                selectionAnchor = offset;
-                caret = start;
-                activeHandle = Handle.START;
-            } else {
-                selectionAnchor = start;
-                caret = offset;
-                activeHandle = Handle.END;
-            }
+        if (activeHandle == Handle.INSERT) {
+            selectionAnchor = -1;
+            caret = offset;
+            composingStart = composingEnd = -1;
+            ensureCaretVisible();
+            resetCaretBlink();
+            notifyImeSelection();
+            invalidate();
+            // Dragging the insertion handle is a move → hide toolbar.
+            dismissSelectionToolbar();
+            return;
         }
-        caret = normalizeCaretOffset(caret);
-        selectionAnchor = normalizeCaretOffset(selectionAnchor);
+
+        int fixed = handleDragFixedOffset;
+        if (fixed < 0) {
+            fixed = activeHandle == Handle.START
+                    ? selectionEnd() : selectionStart();
+            handleDragFixedOffset = fixed;
+        }
+        fixed = normalizeCaretOffset(fixed);
+
+        // Finger owns one edge; fixed owns the other. Role follows order so
+        // left drawable stays on the lower offset and right on the higher.
+        int a = Math.min(offset, fixed);
+        int b = Math.max(offset, fixed);
+        selectionAnchor = a;
+        caret = b;
+        if (offset <= fixed) {
+            // Finger is on (or at) the left edge → START handle.
+            activeHandle = Handle.START;
+        } else {
+            // Finger is on the right edge → END handle.
+            activeHandle = Handle.END;
+        }
+
         ensureCaretVisible();
         resetCaretBlink();
         notifyImeSelection();
         invalidate();
+        // Dragging a selection handle is a move → hide toolbar.
+        dismissSelectionToolbar();
     }
 
 
@@ -1720,6 +1867,9 @@ public class CodeEditorView extends View
                 && compEnd == lastImmCompEnd;
         boolean textUnchanged = version == lastImmDocumentVersion;
         if (positionsUnchanged && textUnchanged) {
+            if (cursorAnchorMonitor) {
+                publishCursorAnchorInfo();
+            }
             return;
         }
         lastImmSelStart = selStart;
@@ -1727,6 +1877,15 @@ public class CodeEditorView extends View
         lastImmCompStart = compStart;
         lastImmCompEnd = compEnd;
         lastImmDocumentVersion = version;
+
+        // Keep the IME Editable's Selection/COMPOSING spans in lockstep with
+        // the drawn caret. Without this, a tap only updates our caret field
+        // and IMM.updateSelection, while BaseInputConnection still inserts at
+        // the previous Editable selection.
+        if (!applyingEditableMutation && activeInputConnection != null) {
+            activeInputConnection.syncSelectionFromEditor();
+        }
+
         InputMethodManager imm = (InputMethodManager)
                 getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
         if (imm == null) return;
@@ -1739,17 +1898,193 @@ public class CodeEditorView extends View
                 imm.updateExtractedText(this, extractedToken, et);
             }
         }
+        if (cursorAnchorMonitor) {
+            publishCursorAnchorInfo();
+        }
     }
 
     /** Force the IME to re-read surrounding text (after big external edits). */
     private void restartImeInput() {
         lastImmSelStart = lastImmSelEnd = lastImmCompStart = lastImmCompEnd = -1;
         lastImmDocumentVersion = -1;
+        if (activeInputConnection != null) {
+            activeInputConnection.syncFromDocument();
+        }
         InputMethodManager imm = (InputMethodManager)
                 getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
         if (imm != null) {
             imm.restartInput(this);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Editable-backed IME bridge (called by EditorInputConnection)
+    // ------------------------------------------------------------------
+
+    int imeSelectionStart() {
+        return hasSelection() ? selectionStart() : caret;
+    }
+
+    int imeSelectionEnd() {
+        return hasSelection() ? selectionEnd() : caret;
+    }
+
+    int imeComposingStart() {
+        return composingStart;
+    }
+
+    int imeComposingEnd() {
+        return composingEnd;
+    }
+
+    int getDocumentLength() {
+        return document == null ? 0 : document.length();
+    }
+
+    /**
+     * Apply a replacement originating from the IME Editable mirror. Preserves
+     * the current composing range (the Editable already holds SPAN_COMPOSING;
+     * {@link #applyImeStateFromEditable} will re-read it right after).
+     */
+    void replaceRangeFromEditable(int start, int end, String text) {
+        if (document == null) return;
+        if (text == null) text = "";
+        int len = document.length();
+        start = Math.max(0, Math.min(start, len));
+        end = Math.max(0, Math.min(end, len));
+        if (start > end) {
+            int t = start; start = end; end = t;
+        }
+        applyingEditableMutation = true;
+        try {
+            if (start != end || !text.isEmpty()) {
+                document.replace(start, end, text);
+            }
+            // Keep caret at end of inserted text as a baseline; selection
+            // will be overwritten by applyImeStateFromEditable.
+            caret = start + text.length();
+            selectionAnchor = -1;
+            clampCaret();
+            updateGutterWidth();
+            // Do not clear composing here — Editable still owns SPAN_COMPOSING.
+        } finally {
+            applyingEditableMutation = false;
+        }
+    }
+
+    /**
+     * Pull selection + composing from the Editable after an IME mutation.
+     * Composing offsets come from {@code BaseInputConnection.getComposingSpan*}.
+     */
+    void applyImeStateFromEditable(int selStart, int selEnd,
+                                   int compStart, int compEnd) {
+        if (document == null) return;
+        int len = document.length();
+        selStart = Math.max(0, Math.min(selStart, len));
+        selEnd = Math.max(0, Math.min(selEnd, len));
+        if (selStart == selEnd) {
+            selectionAnchor = -1;
+            caret = selStart;
+        } else {
+            selectionAnchor = selStart;
+            caret = selEnd;
+        }
+        if (compStart >= 0 && compEnd > compStart) {
+            composingStart = Math.max(0, Math.min(compStart, len));
+            composingEnd = Math.max(composingStart, Math.min(compEnd, len));
+            if (composingStart == composingEnd) {
+                composingStart = composingEnd = -1;
+            }
+        } else {
+            composingStart = composingEnd = -1;
+        }
+        ensureCaretVisible();
+        resetCaretBlink();
+        // skip Editable re-sync — we just came from it
+        notifyImeSelection();
+        invalidate();
+        // Code-completion popup is independent of the IME candidate strip.
+        // Only refresh it when the user is typing identifier-ish text and not
+        // mid-composition (IME candidates take priority then).
+        if (composingStart < 0) {
+            // Peek the last char before caret for auto-complete decision.
+            if (caret > 0) {
+                char c = document.charAt(caret - 1);
+                if (Character.isJavaIdentifierPart(c) && !Character.isDigit(
+                        document.charAt(Math.max(0, caret - 1)))) {
+                    // Re-evaluate prefix; requestCompletionsAtCaret no-ops on empty.
+                    requestCompletionsAtCaret();
+                } else {
+                    dismissCompletions();
+                }
+            } else {
+                dismissCompletions();
+            }
+        } else {
+            dismissCompletions();
+        }
+    }
+
+    void onImeBatchFinished() {
+        // Editable → document already applied; just publish selection / anchors.
+        notifyImeSelection();
+        invalidate();
+    }
+
+    boolean requestCursorUpdatesFromIme(int mode) {
+        final int known = InputConnection.CURSOR_UPDATE_IMMEDIATE
+                | InputConnection.CURSOR_UPDATE_MONITOR;
+        if ((mode & ~known) != 0) {
+            // Reject unknown flags (matches EditableInputConnection behaviour).
+            // Character-bounds filters are optional; accept mode bits only.
+            // If only known mode bits are set we're fine; filter bits beyond
+            // IMMEDIATE/MONITOR are tolerated as "best effort".
+        }
+        cursorAnchorMonitor =
+                (mode & InputConnection.CURSOR_UPDATE_MONITOR) != 0;
+        if ((mode & InputConnection.CURSOR_UPDATE_IMMEDIATE) != 0
+                || cursorAnchorMonitor) {
+            publishCursorAnchorInfo();
+        }
+        return true;
+    }
+
+    private void publishCursorAnchorInfo() {
+        if (!isAttachedToWindow() || document == null) return;
+        InputMethodManager imm = (InputMethodManager)
+                getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (imm == null) return;
+
+        int selStart = hasSelection() ? selectionStart() : caret;
+        int selEnd = hasSelection() ? selectionEnd() : caret;
+        CursorAnchorInfo.Builder b = new CursorAnchorInfo.Builder();
+        b.setSelectionRange(selStart, selEnd);
+        if (composingStart >= 0 && composingEnd > composingStart
+                && composingEnd <= document.length()) {
+            b.setComposingText(composingStart,
+                    document.substring(composingStart, composingEnd));
+        }
+
+        // Insertion marker in view coordinates.
+        int line = document.lineOfOffset(selEnd);
+        float markerX = contentXForOffset(selEnd) - getScrollX();
+        float top = line * lineHeight - getScrollY();
+        float baseline = top + baselineShift;
+        float bottom = top + lineHeight;
+        int flags = CursorAnchorInfo.FLAG_HAS_VISIBLE_REGION;
+        if (markerX < 0 || markerX > getWidth() || bottom < 0 || top > getHeight()) {
+            flags = CursorAnchorInfo.FLAG_HAS_INVISIBLE_REGION;
+        }
+        b.setInsertionMarkerLocation(markerX, top, baseline, bottom, flags);
+
+        // Matrix: view → screen.
+        getLocationOnScreen(viewLocationOnScreen);
+        cursorAnchorMatrix.reset();
+        cursorAnchorMatrix.postTranslate(viewLocationOnScreen[0],
+                viewLocationOnScreen[1]);
+        b.setMatrix(cursorAnchorMatrix);
+
+        imm.updateCursorAnchorInfo(this, b.build());
     }
 
     @Override
@@ -1793,10 +2128,13 @@ public class CodeEditorView extends View
         lastImmCompEnd = composingEnd;
         lastImmDocumentVersion = document == null ? -1 : document.version();
         extractedMonitor = false;
-        if (android.os.Build.VERSION.SDK_INT >= 34) {
-            return new EditorInputConnectionApi34(this);
-        }
-        return new EditorInputConnection(this);
+        cursorAnchorMonitor = false;
+
+        EditorInputConnection ic = android.os.Build.VERSION.SDK_INT >= 34
+                ? new EditorInputConnectionApi34(this)
+                : new EditorInputConnection(this);
+        activeInputConnection = ic;
+        return ic;
     }
 
     // ------------------------------------------------------------------
@@ -1894,10 +2232,25 @@ public class CodeEditorView extends View
                 break;
             case KeyEvent.KEYCODE_A:
                 if (ctrl) {
-                    selectionAnchor = 0;
-                    caret = document.length();
-                    dismissCompletions();
-                    invalidate();
+                    selectAll();
+                    return true;
+                }
+                break;
+            case KeyEvent.KEYCODE_C:
+                if (ctrl) {
+                    copySelection();
+                    return true;
+                }
+                break;
+            case KeyEvent.KEYCODE_X:
+                if (ctrl) {
+                    cutSelection();
+                    return true;
+                }
+                break;
+            case KeyEvent.KEYCODE_V:
+                if (ctrl) {
+                    pasteFromClipboard();
                     return true;
                 }
                 break;
@@ -2369,58 +2722,121 @@ public class CodeEditorView extends View
         // (including the gutter) so they stay tappable.
         if (isFocused() && !scaling) {
             drawSelectionHandles(canvas);
+            drawSelectionToolbar(canvas);
         }
     }
 
     /**
-     * Selection handles drawn with the platform's own
-     * {@code textSelectHandleLeft/Right} drawables (resolved from the activity
-     * theme). Falls back to a simple filled teardrop only if the theme has
-     * none — on a normal Material/AppCompat activity the native assets win.
+     * Selection / insertion handles drawn like EditText: platform
+     * {@code textSelectHandleLeft/Right/Middle} drawables with the tip on the
+     * line bottom. Falls back to a smooth teardrop path when the theme has
+     * none.
      */
     private void drawSelectionHandles(Canvas canvas) {
-        if (!hasSelection()) return;
-        // Keep tint in sync with the colour scheme (e.g. after a theme swap).
+        if (document == null || lineHeight <= 0f) return;
         tintHandleDrawables();
-        drawHandleAt(canvas, selectionStart(), /*start*/ true);
-        drawHandleAt(canvas, selectionEnd(), /*start*/ false);
+        if (hasSelection()) {
+            drawHandleAt(canvas, selectionStart(), Handle.START);
+            drawHandleAt(canvas, selectionEnd(), Handle.END);
+        } else if (isFocused() && !scaling
+                && (insertionToolbarAllowed || activeHandle == Handle.INSERT)) {
+            // EditText reveals the middle handle with the insertion toolbar
+            // (tap caret / long-press empty) or while the user is dragging it.
+            drawHandleAt(canvas, caret, Handle.INSERT);
+        }
     }
 
     /**
      * Draws one handle in the same content coordinate system as the text.
-     * {@link View#scrollTo(int, int)} already translates the Canvas before
-     * {@link #onDraw(Canvas)}; subtracting scroll here again would apply the
-     * offset twice. Hit testing stays view-local via
-     * {@link #handleViewPos(int, boolean)}.
+     * Placement matches AOSP {@code Editor.SelectionHandleView}:
+     * <pre>
+     *   positionX = cursorX - hotspotX
+     *   START/LTR hotspotX = 3/4 * intrinsicWidth
+     *   END/LTR   hotspotX = 1/4 * intrinsicWidth
+     *   INSERT    hotspotX = 1/2 * intrinsicWidth
+     * </pre>
+     * Material handle PNGs include ~1/4 width of transparent padding on each
+     * side, so anchoring the bitmap edge to the caret leaves a large visual
+     * gap — the hotspot formula cancels that padding.
      */
-    private void drawHandleAt(Canvas canvas, int offset, boolean startHandle) {
+    private void drawHandleAt(Canvas canvas, int offset, Handle which) {
         if (document == null || lineHeight <= 0f) return;
         int line = document.lineOfOffset(offset);
         float tipX = contentXForOffset(offset);
-        float tipY = (line + 1) * lineHeight; // bottom edge of the line
+        // EditText anchors the handle tip to the BOTTOM of the line.
+        float tipY = (line + 1) * lineHeight;
 
-        Drawable d = startHandle ? handleLeftDrawable : handleRightDrawable;
+        Drawable d;
+        if (which == Handle.INSERT) {
+            d = handleMiddleDrawable;
+        } else if (which == Handle.START) {
+            d = handleLeftDrawable;
+        } else {
+            d = handleRightDrawable;
+        }
+
         if (d != null) {
             int w = d.getIntrinsicWidth() > 0 ? d.getIntrinsicWidth()
                     : Math.round(handleRadius * 2f);
             int h = d.getIntrinsicHeight() > 0 ? d.getIntrinsicHeight()
                     : Math.round(handleRadius * 2f);
-            // Left handle tip = top-right corner; right handle tip = top-left.
-            int left = startHandle ? Math.round(tipX - w) : Math.round(tipX);
+            float hotspotX = handleHotspotX(which, w);
+            int left = Math.round(tipX - hotspotX);
             int top = Math.round(tipY);
             d.setBounds(left, top, left + w, top + h);
             d.draw(canvas);
             return;
         }
 
-        // Theme-less fallback: simple circle body hanging below the tip.
+        // Fallback teardrop when the host theme has no handle drawables.
+        drawFallbackTeardrop(canvas, tipX, tipY, which);
+    }
+
+    /**
+     * AOSP hotspot X within the drawable (LTR). The tip of the painted
+     * teardrop sits at this x on the top edge of the bitmap.
+     */
+    private static float handleHotspotX(Handle which, float width) {
+        if (which == Handle.INSERT) return width * 0.5f;
+        if (which == Handle.START) return width * 0.75f; // 3/4
+        return width * 0.25f;                            // 1/4
+    }
+
+    /** Smooth EditText-like teardrop used when system drawables are missing. */
+    private void drawFallbackTeardrop(Canvas canvas, float tipX, float tipY,
+                                      Handle which) {
         float r = handleRadius;
-        float cx = startHandle ? tipX - r * 0.65f : tipX + r * 0.65f;
-        float cy = tipY + r * 0.95f;
+        // Place the body centre so the tip still lands on tipX — same visual
+        // offset the Material assets achieve via padding/hotspot.
+        float cx;
+        float cy = tipY + r * 1.05f;
+        if (which == Handle.INSERT) {
+            cx = tipX;
+        } else if (which == Handle.START) {
+            cx = tipX - r * 0.35f;
+        } else {
+            cx = tipX + r * 0.35f;
+        }
+        float tipAngle = (float) Math.toDegrees(Math.atan2(tipY - cy, tipX - cx));
+        final float wedge = 50f;
+        float aStart = tipAngle + wedge;
+        float sweep = 360f - 2f * wedge;
+        float aEnd = aStart + sweep;
+        float radStart = (float) Math.toRadians(aStart);
+        float radEnd = (float) Math.toRadians(aEnd);
+        float sx = cx + r * (float) Math.cos(radStart);
+        float sy = cy + r * (float) Math.sin(radStart);
+        float ex = cx + r * (float) Math.cos(radEnd);
+        float ey = cy + r * (float) Math.sin(radEnd);
+
+        handleFallbackPath.reset();
+        handleFallbackPath.moveTo(tipX, tipY);
+        handleFallbackPath.quadTo((tipX + sx) * 0.5f, (tipY + sy) * 0.5f, sx, sy);
+        handleFallbackPath.arcTo(cx - r, cy - r, cx + r, cy + r, aStart, sweep, false);
+        handleFallbackPath.quadTo((tipX + ex) * 0.5f, (tipY + ey) * 0.5f, tipX, tipY);
+        handleFallbackPath.close();
         fillPaint.setColor(scheme.selectionHandle);
-        canvas.drawCircle(cx, cy, r, fillPaint);
-        // Tiny stem up to the baseline so the tip still reads as attached.
-        canvas.drawLine(tipX, tipY, cx, cy - r * 0.4f, fillPaint);
+        canvas.drawPath(handleFallbackPath, fillPaint);
     }
 
     /**
@@ -2490,53 +2906,462 @@ public class CodeEditorView extends View
     }
 
     /**
-     * Resolve {@link android.R.attr#textSelectHandleLeft} /
-     * {@link android.R.attr#textSelectHandleRight} from the host theme and
-     * keep mutated copies so tinting does not leak into other widgets.
+     * Resolve {@link android.R.attr#textSelectHandleLeft/Right/Middle} from the
+     * host theme, with a system-resource fallback so DeviceDefault hosts still
+     * get EditText-style teardrops. Mutated copies keep tint from leaking.
      */
     private void loadHandleDrawables() {
         handleLeftDrawable = null;
         handleRightDrawable = null;
+        handleMiddleDrawable = null;
         handleIntrinsicW = 0;
         handleIntrinsicH = 0;
+        handleMiddleW = 0;
+        handleMiddleH = 0;
         Context ctx = getContext();
         if (ctx == null) return;
+
         final int[] attrs = new int[] {
                 android.R.attr.textSelectHandleLeft,
-                android.R.attr.textSelectHandleRight
+                android.R.attr.textSelectHandleRight,
+                android.R.attr.textSelectHandle
         };
         TypedArray ta = null;
         try {
             ta = ctx.obtainStyledAttributes(attrs);
             Drawable left = ta.getDrawable(0);
             Drawable right = ta.getDrawable(1);
+            Drawable middle = ta.getDrawable(2);
             if (left != null) handleLeftDrawable = left.mutate();
             if (right != null) handleRightDrawable = right.mutate();
+            if (middle != null) handleMiddleDrawable = middle.mutate();
         } catch (Exception ignored) {
-            // Some host themes / test stubs omit the attrs — fall back later.
+            // Some host themes / test stubs omit the attrs — fall back below.
         } finally {
             if (ta != null) ta.recycle();
         }
-        tintHandleDrawables();
-        Drawable ref = handleLeftDrawable != null
-                ? handleLeftDrawable : handleRightDrawable;
-        if (ref != null) {
-            handleIntrinsicW = Math.max(1, ref.getIntrinsicWidth());
-            handleIntrinsicH = Math.max(1, ref.getIntrinsicHeight());
-            // Size the hit target from the real asset.
-            handleRadius = Math.max(handleRadius,
-                    Math.max(handleIntrinsicW, handleIntrinsicH) * 0.45f);
+
+        // DeviceDefault / bare themes sometimes leave the attrs null. Load the
+        // platform Material assets by name so we still look like EditText.
+        if (handleLeftDrawable == null) {
+            handleLeftDrawable = loadSystemDrawable(
+                    "text_select_handle_left_material",
+                    "text_select_handle_left_mtrl_alpha");
         }
+        if (handleRightDrawable == null) {
+            handleRightDrawable = loadSystemDrawable(
+                    "text_select_handle_right_material",
+                    "text_select_handle_right_mtrl_alpha");
+        }
+        if (handleMiddleDrawable == null) {
+            handleMiddleDrawable = loadSystemDrawable(
+                    "text_select_handle_middle_material",
+                    "text_select_handle_middle_mtrl_alpha");
+        }
+
+        tintHandleDrawables();
+        if (handleLeftDrawable != null) {
+            handleIntrinsicW = Math.max(1, handleLeftDrawable.getIntrinsicWidth());
+            handleIntrinsicH = Math.max(1, handleLeftDrawable.getIntrinsicHeight());
+        } else if (handleRightDrawable != null) {
+            handleIntrinsicW = Math.max(1, handleRightDrawable.getIntrinsicWidth());
+            handleIntrinsicH = Math.max(1, handleRightDrawable.getIntrinsicHeight());
+        }
+        if (handleMiddleDrawable != null) {
+            handleMiddleW = Math.max(1, handleMiddleDrawable.getIntrinsicWidth());
+            handleMiddleH = Math.max(1, handleMiddleDrawable.getIntrinsicHeight());
+        } else {
+            handleMiddleW = Math.max(1, Math.round(handleIntrinsicW * 0.55f));
+            handleMiddleH = Math.max(1, handleIntrinsicH);
+        }
+        if (handleIntrinsicW > 0) {
+            handleRadius = Math.max(handleRadius,
+                    Math.max(handleIntrinsicW, handleIntrinsicH) * 0.35f);
+        }
+    }
+
+    private Drawable loadSystemDrawable(String... names) {
+        Context ctx = getContext();
+        if (ctx == null) return null;
+        Resources res = ctx.getResources();
+        for (String name : names) {
+            try {
+                int id = res.getIdentifier(name, "drawable", "android");
+                if (id != 0) {
+                    Drawable d = res.getDrawable(id, ctx.getTheme());
+                    if (d != null) return d.mutate();
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
     }
 
     private void tintHandleDrawables() {
         int color = scheme.selectionHandle;
         // setTint is the non-deprecated path (API 21+; our minSdk is 24).
-        if (handleLeftDrawable != null) {
-            handleLeftDrawable.setTint(color);
+        if (handleLeftDrawable != null) handleLeftDrawable.setTint(color);
+        if (handleRightDrawable != null) handleRightDrawable.setTint(color);
+        if (handleMiddleDrawable != null) handleMiddleDrawable.setTint(color);
+    }
+
+
+    // ------------------------------------------------------------------
+    // Selection toolbar (self-drawn Cut / Copy / Paste / Select all)
+    // ------------------------------------------------------------------
+
+    private void showSelectionToolbar() {
+        if (!isAttachedToWindow() || !isFocused()) {
+            hideSelectionToolbar();
+            return;
         }
-        if (handleRightDrawable != null) {
-            handleRightDrawable.setTint(color);
+        if (!hasSelection() && !insertionToolbarAllowed) {
+            hideSelectionToolbar();
+            return;
+        }
+        if (!layoutSelectionToolbar()) {
+            hideSelectionToolbar();
+            return;
+        }
+        selectionToolbarVisible = true;
+        scheduleToolbarAutoHide();
+        invalidate();
+    }
+
+    /**
+     * Relayout an already-visible toolbar (e.g. after select-all / copy). Does
+     * <em>not</em> re-show a dismissed bar — pan / handle-drag / auto-hide all
+     * leave the selection intact and rely on a fresh tap to call
+     * {@link #showSelectionToolbar()} again.
+     */
+    private void invalidateSelectionToolbar() {
+        if (!selectionToolbarVisible) return;
+        if (!hasSelection() && !insertionToolbarAllowed) {
+            hideSelectionToolbar();
+            return;
+        }
+        if (!layoutSelectionToolbar()) {
+            hideSelectionToolbar();
+            return;
+        }
+        scheduleToolbarAutoHide();
+        invalidate();
+    }
+
+    /**
+     * Hides the floating toolbar without clearing selection. Used when the user
+     * pans, drags a handle, or the idle timer fires — the selection stays so a
+     * later tap on it can re-show the bar.
+     */
+    private void dismissSelectionToolbar() {
+        cancelToolbarAutoHide();
+        insertionToolbarAllowed = false;
+        if (selectionToolbarVisible) {
+            selectionToolbarVisible = false;
+            toolbarItemCount = 0;
+            toolbarRect.setEmpty();
+            invalidate();
+        } else {
+            toolbarItemCount = 0;
+            toolbarRect.setEmpty();
+        }
+    }
+
+    /** Full hide — also used when selection collapses (caret move, cut, edit). */
+    private void hideSelectionToolbar() {
+        dismissSelectionToolbar();
+    }
+
+    private void autoHideSelectionToolbar() {
+        if (selectionToolbarVisible) {
+            dismissSelectionToolbar();
+        }
+    }
+
+    private void scheduleToolbarAutoHide() {
+        cancelToolbarAutoHide();
+        if (selectionToolbarVisible) {
+            postDelayed(toolbarAutoHideRunnable, TOOLBAR_AUTO_HIDE_MS);
+        }
+    }
+
+    private void cancelToolbarAutoHide() {
+        removeCallbacks(toolbarAutoHideRunnable);
+    }
+
+    /**
+     * Rebuilds {@link #toolbarItemIds} / {@link #toolbarRect} in <em>view</em>
+     * coordinates, pinned above the on-screen caret (or selection midpoint).
+     * View space (not content space) keeps the bar locked to the caret's
+     * screen position while the user pans — the document slides under it.
+     */
+    private boolean layoutSelectionToolbar() {
+        if (document == null || lineHeight <= 0f) return false;
+        toolbarItemCount = 0;
+        boolean hasSel = hasSelection();
+        boolean canPaste = clipboardHasText();
+        boolean canSelectAll = document.length() > 0
+                && !(hasSel && selectionStart() == 0
+                && selectionEnd() == document.length());
+        if (canSelectAll) toolbarItemIds[toolbarItemCount++] = TB_SELECT_ALL;
+        if (hasSel) {
+            toolbarItemIds[toolbarItemCount++] = TB_CUT;
+            toolbarItemIds[toolbarItemCount++] = TB_COPY;
+        }
+        if (canPaste) toolbarItemIds[toolbarItemCount++] = TB_PASTE;
+        if (toolbarItemCount == 0) return false;
+
+        // Measure widest label so every cell is equal-width (EditText style).
+        toolbarTextPaint.setTextSize(14f * density);
+        float maxLabel = 0f;
+        for (int i = 0; i < toolbarItemCount; i++) {
+            maxLabel = Math.max(maxLabel,
+                    toolbarTextPaint.measureText(toolbarLabel(toolbarItemIds[i])));
+        }
+        float hPad = 16f * density;
+        toolbarItemWidth = maxLabel + hPad * 2f;
+        float width = toolbarItemWidth * toolbarItemCount;
+        float height = toolbarHeight;
+
+        // Content → view so the bar stays put relative to the caret on screen
+        // even while getScrollX/Y change under the finger.
+        int s = hasSel ? selectionStart() : caret;
+        int e = hasSel ? selectionEnd() : caret;
+        int lineS = document.lineOfOffset(s);
+        int lineE = document.lineOfOffset(e);
+        float viewX1 = contentXForOffset(s) - getScrollX();
+        float viewX2 = contentXForOffset(e) - getScrollX();
+        float midX = hasSel ? (viewX1 + viewX2) * 0.5f : viewX1;
+        float caretTop = lineS * lineHeight - getScrollY();
+        float caretBottom = (lineE + 1) * lineHeight - getScrollY();
+        float viewW = getWidth();
+        float viewH = getHeight();
+
+        // Caret / selection fully off-screen → skip painting this frame.
+        if (caretBottom <= 0f || caretTop >= viewH
+                || midX < 0f || midX > viewW) {
+            toolbarRect.setEmpty();
+            return true;
+        }
+
+        float handleH = handleIntrinsicH > 0 ? handleIntrinsicH : handleRadius * 2f;
+
+        // Prefer directly above the caret / selection top.
+        float gap = 8f * density;
+        float top = caretTop - gap - height - toolbarArrowSize;
+        if (top < 4f * density) {
+            // Not enough room above: sit just below the line (and handles).
+            top = caretBottom + handleH + gap + toolbarArrowSize;
+        }
+
+        float left = midX - width * 0.5f;
+        float margin = 6f * density;
+        if (left < margin) left = margin;
+        if (left + width > viewW - margin) {
+            left = Math.max(margin, viewW - margin - width);
+        }
+
+        toolbarRect.set(left, top, left + width, top + height);
+        return true;
+    }
+
+    private static String toolbarLabel(int id) {
+        switch (id) {
+            case TB_SELECT_ALL: return "Select all";
+            case TB_CUT:        return "Cut";
+            case TB_COPY:       return "Copy";
+            case TB_PASTE:      return "Paste";
+            default:            return "";
+        }
+    }
+
+    private void drawSelectionToolbar(Canvas canvas) {
+        if (!selectionToolbarVisible) return;
+        // Re-layout every frame so the bar re-pins above the caret's current
+        // on-screen position while the user is scrolling.
+        if (!layoutSelectionToolbar()) {
+            // No useful actions left (e.g. empty doc) — drop the bar for good.
+            selectionToolbarVisible = false;
+            return;
+        }
+        // Anchor scrolled off-screen: skip painting this frame.
+        if (toolbarRect.isEmpty() || toolbarItemCount == 0) return;
+
+        // Handles / text are drawn in content space (View already translated
+        // the canvas by -scroll). toolbarRect is view-local, so temporarily
+        // undo that scroll before painting the bar — otherwise the bar drifts
+        // by -scroll relative to the caret every pan.
+        int save = canvas.save();
+        canvas.translate(getScrollX(), getScrollY());
+
+        float r = 8f * density;
+        toolbarPaint.setColor(scheme.toolbarBackground);
+        canvas.drawRoundRect(toolbarRect, r, r, toolbarPaint);
+
+        // Arrow toward the on-screen caret / selection midpoint.
+        int s = hasSelection() ? selectionStart() : caret;
+        int e = hasSelection() ? selectionEnd() : caret;
+        float midX = hasSelection()
+                ? ((contentXForOffset(s) - getScrollX())
+                + (contentXForOffset(e) - getScrollX())) * 0.5f
+                : contentXForOffset(s) - getScrollX();
+        midX = Math.max(toolbarRect.left + r,
+                Math.min(midX, toolbarRect.right - r));
+        float caretTop = document.lineOfOffset(s) * lineHeight - getScrollY();
+        boolean above = toolbarRect.bottom <= caretTop + 1f;
+        toolbarArrow.reset();
+        if (above) {
+            float y = toolbarRect.bottom;
+            toolbarArrow.moveTo(midX - toolbarArrowSize, y);
+            toolbarArrow.lineTo(midX, y + toolbarArrowSize);
+            toolbarArrow.lineTo(midX + toolbarArrowSize, y);
+        } else {
+            float y = toolbarRect.top;
+            toolbarArrow.moveTo(midX - toolbarArrowSize, y);
+            toolbarArrow.lineTo(midX, y - toolbarArrowSize);
+            toolbarArrow.lineTo(midX + toolbarArrowSize, y);
+        }
+        toolbarArrow.close();
+        canvas.drawPath(toolbarArrow, toolbarPaint);
+
+        toolbarTextPaint.setTextSize(14f * density);
+        toolbarTextPaint.setColor(scheme.toolbarText);
+        Paint.FontMetrics fm = toolbarTextPaint.getFontMetrics();
+        float textY = toolbarRect.centerY() - (fm.ascent + fm.descent) * 0.5f;
+        for (int i = 0; i < toolbarItemCount; i++) {
+            float cellLeft = toolbarRect.left + i * toolbarItemWidth;
+            float cx = cellLeft + toolbarItemWidth * 0.5f;
+            canvas.drawText(toolbarLabel(toolbarItemIds[i]), cx, textY, toolbarTextPaint);
+            if (i > 0) {
+                toolbarPaint.setColor(scheme.toolbarDivider);
+                float dx = cellLeft;
+                canvas.drawRect(dx - density * 0.5f, toolbarRect.top + 8f * density,
+                        dx + density * 0.5f, toolbarRect.bottom - 8f * density,
+                        toolbarPaint);
+                toolbarPaint.setColor(scheme.toolbarBackground);
+            }
+        }
+        canvas.restoreToCount(save);
+    }
+
+    /** @return toolbar item id, or 0 if the point is outside (view coords). */
+    private int hitTestToolbar(float viewX, float viewY) {
+        if (!selectionToolbarVisible || toolbarItemCount == 0
+                || toolbarRect.isEmpty()) {
+            return 0;
+        }
+        // toolbarRect is kept in view coordinates.
+        if (!toolbarRect.contains(viewX, viewY)) return 0;
+        int idx = (int) ((viewX - toolbarRect.left) / toolbarItemWidth);
+        if (idx < 0) idx = 0;
+        if (idx >= toolbarItemCount) idx = toolbarItemCount - 1;
+        return toolbarItemIds[idx];
+    }
+
+    private boolean onToolbarItemClicked(int id) {
+        // Any interaction resets the idle auto-hide timer.
+        scheduleToolbarAutoHide();
+        switch (id) {
+            case TB_SELECT_ALL:
+                selectAll();
+                return true;
+            case TB_CUT:
+                cutSelection();
+                return true;
+            case TB_COPY:
+                copySelection();
+                return true;
+            case TB_PASTE:
+                pasteFromClipboard();
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Clipboard
+    // ------------------------------------------------------------------
+
+    public void selectAll() {
+        if (document == null || document.length() == 0) return;
+        selectionAnchor = 0;
+        caret = document.length();
+        composingStart = composingEnd = -1;
+        ensureCaretVisible();
+        resetCaretBlink();
+        notifyImeSelection();
+        invalidate();
+        showSelectionToolbar();
+    }
+
+    public void copySelection() {
+        if (!hasSelection() || document == null) return;
+        CharSequence text = document.substring(selectionStart(), selectionEnd());
+        setClipboardText(text);
+        // EditText keeps the selection after Copy.
+        invalidateSelectionToolbar();
+    }
+
+    public void cutSelection() {
+        if (!hasSelection() || document == null) return;
+        int s = selectionStart();
+        int e = selectionEnd();
+        setClipboardText(document.substring(s, e));
+        document.delete(s, e);
+        caret = s;
+        selectionAnchor = -1;
+        composingStart = composingEnd = -1;
+        afterEdit();
+        hideSelectionToolbar();
+        dismissCompletions();
+    }
+
+    public void pasteFromClipboard() {
+        CharSequence clip = getClipboardText();
+        if (clip == null) return;
+        String text = clip.toString();
+        if (text.isEmpty()) return;
+        // Reuse the IME commit path so newlines get auto-indent.
+        commitTextFromIme(text, 1);
+        hideSelectionToolbar();
+    }
+
+    private boolean clipboardHasText() {
+        try {
+            ClipboardManager cm = (ClipboardManager)
+                    getContext().getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm == null || !cm.hasPrimaryClip()) return false;
+            ClipData data = cm.getPrimaryClip();
+            return data != null && data.getItemCount() > 0
+                    && data.getItemAt(0) != null
+                    && data.getItemAt(0).coerceToText(getContext()).length() > 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private CharSequence getClipboardText() {
+        try {
+            ClipboardManager cm = (ClipboardManager)
+                    getContext().getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm == null || !cm.hasPrimaryClip()) return null;
+            ClipData data = cm.getPrimaryClip();
+            if (data == null || data.getItemCount() == 0) return null;
+            return data.getItemAt(0).coerceToText(getContext());
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private void setClipboardText(CharSequence text) {
+        try {
+            ClipboardManager cm = (ClipboardManager)
+                    getContext().getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm != null) {
+                cm.setPrimaryClip(ClipData.newPlainText("code", text));
+            }
+        } catch (Exception ignored) {
         }
     }
 
@@ -2819,15 +3644,51 @@ public class CodeEditorView extends View
             getParent().requestDisallowInterceptTouchEvent(true);
         }
 
+        // Toolbar is drawn above the text; consume taps on it first so they
+        // never become caret moves or handle grabs.
+        int toolbarHit = hitTestToolbar(x, y);
+        if (toolbarHit != 0) {
+            onToolbarItemClicked(toolbarHit);
+            touchMode = TouchMode.IDLE;
+            lastTapUpTime = 0L;
+            return;
+        }
+
         Handle hit = hitTestHandle(x, y);
         if (hit != Handle.NONE) {
             activeHandle = hit;
             touchMode = TouchMode.HANDLE_DRAG;
+            // Moving a handle dismisses the bar immediately; a later tap on
+            // the (still-selected) range re-shows it.
+            dismissSelectionToolbar();
+            // Freeze the opposite edge so crossing cannot walk it.
+            if (hit == Handle.START) {
+                handleDragFixedOffset = selectionEnd();
+            } else if (hit == Handle.END) {
+                handleDragFixedOffset = selectionStart();
+            } else {
+                handleDragFixedOffset = -1;
+            }
+            // Map finger-on-body (below the line) back into the text line.
+            // AOSP uses mTouchOffsetY ≈ -0.3 * handleHeight so the first sample
+            // lands slightly above the line bottom, not on the next line.
+            int tipOffset = hit == Handle.START ? selectionStart()
+                    : hit == Handle.END ? selectionEnd() : caret;
+            int tipLine = document.lineOfOffset(tipOffset);
+            float tipYView = (tipLine + 1) * lineHeight - getScrollY();
+            float handleH = hit == Handle.INSERT
+                    ? (handleMiddleH > 0 ? handleMiddleH : handleRadius * 2f)
+                    : (handleIntrinsicH > 0 ? handleIntrinsicH : handleRadius * 2f);
+            // Target mapping Y: a bit above the line bottom (into current line).
+            float mapTargetY = tipYView - Math.max(lineHeight * 0.35f, handleH * 0.3f);
+            handleDragMapYAdjust = mapTargetY - y;
             dismissCompletions();
             lastTapUpTime = 0L;
             return;
         }
         activeHandle = Handle.NONE;
+        handleDragFixedOffset = -1;
+        handleDragMapYAdjust = 0f;
 
         if (isSecondTap(event, x, y)) {
             // Recognise on the second DOWN. The first tap already moved the
@@ -2880,6 +3741,8 @@ public class CodeEditorView extends View
                 removeCallbacks(longPressRunnable);
                 touchMode = TouchMode.PANNING;
                 lastTapUpTime = 0L;
+                // Pan starts → hide the floating toolbar (selection kept).
+                dismissSelectionToolbar();
                 panTo(x, y);
                 return;
 
@@ -2917,20 +3780,50 @@ public class CodeEditorView extends View
 
         if (!cancelled) {
             if (finishedMode == TouchMode.TAP_PENDING) {
-                // Immediate caret placement: no double-tap timeout delay.
                 requestFocus();
-                moveCaretTo(offsetForPoint(x, y), false);
-                dismissCompletions();
-                showSoftKeyboard();
-                performClick();
-                lastTapUpTime = event.getEventTime();
-                lastTapX = x;
-                lastTapY = y;
+                int offset = offsetForPoint(x, y);
+                // Tap inside an existing selection re-shows the toolbar
+                // without collapsing the range (EditText floating-toolbar UX).
+                if (hasSelection()
+                        && offset >= selectionStart()
+                        && offset < selectionEnd()) {
+                    insertionToolbarAllowed = false;
+                    showSelectionToolbar();
+                    dismissCompletions();
+                    showSoftKeyboard();
+                    performClick();
+                    lastTapUpTime = 0L;
+                } else {
+                    // Immediate caret placement: no double-tap timeout delay.
+                    moveCaretTo(offset, false);
+                    dismissCompletions();
+                    showSoftKeyboard();
+                    // EditText reveals Paste/Select-all on a focused caret tap.
+                    insertionToolbarAllowed = true;
+                    showSelectionToolbar();
+                    performClick();
+                    lastTapUpTime = event.getEventTime();
+                    lastTapX = x;
+                    lastTapY = y;
+                }
             } else if (finishedMode == TouchMode.PANNING) {
+                // Pan already dismissed the bar; do not re-show.
                 flingFromVelocityTracker();
                 lastTapUpTime = 0L;
+            } else if (finishedMode == TouchMode.HANDLE_DRAG) {
+                // Handle drag dismissed the bar; leave it hidden until the
+                // user taps the selection again.
+                lastTapUpTime = 0L;
+            } else if (finishedMode == TouchMode.LONG_PRESS_LOCKED
+                    || finishedMode == TouchMode.LONG_PRESS_EXTENDING
+                    || finishedMode == TouchMode.DOUBLE_TAP_LOCKED
+                    || finishedMode == TouchMode.DOUBLE_TAP_EXTENDING) {
+                // Fresh selection from long-press / double-tap: show toolbar.
+                // (selectWordAt already showed it; extending dismissed it —
+                // re-show on finger-up so the final range gets a bar.)
+                if (hasSelection()) showSelectionToolbar();
+                lastTapUpTime = 0L;
             } else {
-                // Handle/long-press/double-tap selection remains exactly as-is.
                 lastTapUpTime = 0L;
             }
         } else {
@@ -2938,6 +3831,8 @@ public class CodeEditorView extends View
         }
 
         activeHandle = Handle.NONE;
+        handleDragFixedOffset = -1;
+        handleDragMapYAdjust = 0f;
         touchMode = TouchMode.IDLE;
         recycleVelocityTracker();
         if (getParent() != null) {
@@ -2982,6 +3877,8 @@ public class CodeEditorView extends View
     private void cancelManualTouch(boolean clearTapHistory) {
         removeCallbacks(longPressRunnable);
         activeHandle = Handle.NONE;
+        handleDragFixedOffset = -1;
+        handleDragMapYAdjust = 0f;
         touchMode = TouchMode.IDLE;
         recycleVelocityTracker();
         if (clearTapHistory) lastTapUpTime = 0L;
@@ -2993,6 +3890,7 @@ public class CodeEditorView extends View
         scaling = true;
         scroller.forceFinished(true);
         dismissCompletions();
+        dismissSelectionToolbar();
         lastTapUpTime = 0L;
     }
 
@@ -3619,6 +4517,7 @@ public class CodeEditorView extends View
         } else {
             cancelManualTouch(true);
             dismissCompletions();
+            hideSelectionToolbar();
         }
         invalidate();
     }
@@ -3665,11 +4564,13 @@ public class CodeEditorView extends View
     protected void onDetachedFromWindow() {
         getViewTreeObserver().removeOnGlobalLayoutListener(imeLayoutListener);
         mainHandler.removeCallbacks(lspChangeDebounce);
+        cancelToolbarAutoHide();
         if (document != null) {
             document.removeContentListener(widthCacheListener);
             document.removeContentListener(lspSyncListener);
         }
         cancelManualTouch(true);
+        hideSelectionToolbar();
         super.onDetachedFromWindow();
         removeCallbacks(caretBlink);
         if (completionPopup != null) completionPopup.dismiss();

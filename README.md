@@ -3,7 +3,9 @@
 A high-performance Android code editor widget built from scratch in Java —
 no `EditText`, no `Spannable`. Supports **grammar-file** languages and
 **jar plugins** for syntax highlighting and code completion. Java and Go
-ship built-in.
+ship built-in. Includes grammar/plugin-driven **LSP**, Android-style
+selection handles, a self-drawn floating toolbar, and a TextView-like
+IME bridge for English predictive input.
 
 ## Architecture
 
@@ -185,6 +187,46 @@ What you get automatically once connected:
 - Completions from the server **merged** with the local grammar list
 - `publishDiagnostics` → squiggly underlines + gutter severity ticks
 
+## Selection & floating toolbar
+
+Selection uses Android theme handle drawables (`textSelectHandleLeft/Right/
+Middle`) with AOSP hotspot placement so Material teardrops sit flush against
+the caret. Dragging past the opposite edge **swaps handle roles** without
+walking the fixed edge.
+
+A self-drawn floating toolbar (Cut / Copy / Paste / Select all) replaces
+`ActionMode`:
+
+- Pinned in **view coordinates** above the caret / selection midpoint so it
+  tracks the on-screen anchor while the document scrolls underneath.
+- **Hidden on pan / handle drag / pinch**, selection kept.
+- **Re-shown by tapping inside the selection** (does not collapse the range).
+- **Auto-hides after 3 s** of idle; tapping a toolbar item resets the timer.
+- Hidden while the anchor is fully off-screen.
+
+## IME (English predictive input)
+
+`EditorInputConnection` mirrors the piece table into a real
+`SpannableStringBuilder` (`BaseInputConnection(fullEditor=true)`), so Gboard /
+Samsung / etc. see the same `Editable` + `SPAN_COMPOSING` model as `TextView`:
+
+- `getEditable()` / `getSurroundingText` / `getExtractedText` / cursor updates
+- Composing region survives backspace (`girl` → delete `l` → still suggests for
+  `gir`)
+- Caret taps push the new selection into the Editable so the next commit /
+  delete lands at the drawn caret
+- API 34 `replaceText` lives in `EditorInputConnectionApi34` so older devices
+  never resolve `TextAttribute`
+
+## Auto-indent & grapheme clusters
+
+- Enter / IME newline copies the previous line's indent; empty `{` blocks split
+  with an extra indent level; typing `}` outdents to the matching open.
+- Tab / Shift+Tab indent or outdent the current line (or every line of a
+  multi-line selection); multi-line paste is re-indented to the caret column.
+- Caret, selection, delete and word-select all snap to grapheme-cluster
+  boundaries via `Paint.getTextRunCursor` (emoji / CJK / combining marks).
+
 ### Design notes
 
 - **Piece table**: original + append-only add buffer; O(log n) line index via
@@ -196,7 +238,12 @@ What you get automatically once connected:
 - **Completion**: debounced; keywords/snippets from `LanguageSpec`; document
   words ranked by prefix / camel-hump / substring; optional LSP merge.
 - **Selection handles**: platform `textSelectHandleLeft/Right` drawables from
-  the activity theme (Material teardrops), tinted to the colour scheme.
+  the activity theme (Material teardrops), tinted to the colour scheme;
+  hotspot-relative hit regions cancel the PNG's transparent padding.
+- **IME**: Editable mirror + `SPAN_COMPOSING`; selection sync on every caret
+  move so predictive candidates track the drawn caret.
+- **Toolbar**: self-drawn, view-anchored; dismiss on pan / handle drag; re-show
+  by tapping the selection; 3 s idle auto-hide.
 - **Threading**: piece table is UI-thread only; workers receive immutable
   string snapshots; LSP I/O is off-thread with UI-posted callbacks.
 
@@ -245,7 +292,8 @@ src/main/java/cn/wty5/editor/...   library sources
   lsp/        LspClient, LspConfig, LspConnector, LspTransport, Diagnostic
   lang/       LanguageSpec (+ lsp field), GrammarLoader, MiniJson
   plugin/     LanguagePlugin (+ getLspConfig), PluginManager
-  view/       CodeEditorView (native handles, diagnostics, auto LSP)
+  view/       CodeEditorView, EditorInputConnection (+Api34),
+              CompletionPopup, self-drawn selection toolbar
 src/main/resources/grammars/   java.json, go.json (classpath, with "lsp" samples)
 grammars/                      same files at project root (dev / loadFromDirectory)
 test/                          CoreTest, GrammarTest, LspTest (plain JDK)

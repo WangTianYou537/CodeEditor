@@ -29,6 +29,11 @@ public class ColorScheme {
     /** IME composing-region underline (English suggestions / CJK preedit). */
     public int composingUnderline = 0xFF89B4FA;
 
+    /** Self-drawn selection floating toolbar. */
+    public int toolbarBackground = 0xFF313244;
+    public int toolbarText = 0xFFCDD6F4;
+    public int toolbarDivider = 0xFF45475A;
+
     public int colorOf(TokenType type) {
         switch (type) {
             case KEYWORD:      return 0xFFCBA6F7;
