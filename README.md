@@ -328,17 +328,81 @@ GitHub Actions workflows (no Gradle required):
 | Workflow | Trigger | What it does |
 |---|---|---|
 | **CI** (`.github/workflows/ci.yml`) | push / PR to `main` | fetch `android.jar`, run tests, build JAR, upload artifact |
-| **Release** (`.github/workflows/release.yml`) | tag `v*.*.*` or manual dispatch | build JAR, publish to **GitHub Packages** (Maven), create GitHub Release with jar/sources/pom |
+| **Release** (`.github/workflows/release.yml`) | tag `v*.*.*` or manual dispatch | build JAR (+sources/javadoc), publish **GitHub Packages**, optionally **Maven Central**, create GitHub Release |
 
 Release from a tag:
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
-# → Release workflow builds, publishes Maven package, opens GitHub Release
+# → Release workflow builds, publishes, opens GitHub Release
 ```
 
 Or **Actions → Release → Run workflow** and enter `0.1.0`.
+
+### Maven Central
+
+Coordinates: **`cn.wty5:codeeditor:<version>`** (same as GitHub Packages).
+
+This is **not** automatic from a plain git push — you must complete Sonatype Portal setup once, then either run the script locally or let the Release workflow upload with secrets.
+
+#### One-time setup
+
+1. **Account** — sign in at [central.sonatype.com](https://central.sonatype.com) (GitHub login is fine).
+2. **Namespace** — claim and verify a namespace that matches `groupId`:
+   - `cn.wty5` → you must prove control of domain **`wty5.cn`** (DNS TXT) on the Portal; **or**
+   - easier for GitHub-only projects: claim `io.github.WangTianYou537` and publish with  
+     `GROUP_ID=io.github.WangTianYou537 ./scripts/build-jar.sh`  
+     (package `cn.wty5.editor` can stay; only Maven coordinates change).
+3. **User token** — Account → *Generate User Token* → keep **username + password** pair.
+4. **GPG key** (signing is mandatory):
+
+```bash
+gpg --full-generate-key   # RSA 4096, no expiry (or long)
+gpg --list-secret-keys --keyid-format LONG
+# publish the public key so Central can verify signatures:
+gpg --keyserver keyserver.ubuntu.com --send-keys YOUR_KEY_ID
+gpg --export-secret-keys -a YOUR_KEY_ID > secring.asc
+```
+
+5. **GitHub repo secrets** (Settings → Secrets and variables → Actions):
+
+| Secret | Value |
+|---|---|
+| `CENTRAL_USERNAME` | Portal user-token username |
+| `CENTRAL_PASSWORD` | Portal user-token password |
+| `GPG_PRIVATE_KEY` | Full ASCII-armored private key (`secring.asc` contents) |
+| `GPG_PASSPHRASE` | Key passphrase (empty string if none) |
+| `GPG_KEY_ID` | Long key id |
+
+After secrets are set, the next `v*.*.*` tag Release run signs a Central bundle and uploads with `publishingType=AUTOMATIC`. Once validated it appears on Maven Central (search.maven.org / repo1) — usually within minutes to a few hours.
+
+#### Local publish
+
+```bash
+VERSION=0.1.0 ./scripts/build-jar.sh          # jar + sources + javadoc + pom
+# Sign + zip only (no upload):
+./scripts/publish-maven-central.sh
+# Sign + upload + wait for PUBLISHED:
+CENTRAL_USERNAME=... CENTRAL_PASSWORD=... \
+  GPG_KEY_ID=... GPG_PASSPHRASE=... \
+  ./scripts/publish-maven-central.sh --upload --wait
+```
+
+Bundle path: `dist/codeeditor-<ver>-central-bundle.zip` (also attachable to the GitHub Release).
+
+#### Consume from Maven Central (after publish)
+
+```kotlin
+repositories { mavenCentral() }
+dependencies {
+    implementation("cn.wty5:codeeditor:0.1.0")
+}
+```
+
+No token needed for consumers once the component is on Central.
+
+### GitHub Packages (optional mirror)
 
 Manual publish (needs a PAT with `write:packages`):
 
@@ -347,10 +411,7 @@ VERSION=0.1.0 ./scripts/build-jar.sh
 GITHUB_TOKEN=ghp_... ./scripts/publish-github-packages.sh
 ```
 
-### Consume from GitHub Packages
-
 ```kotlin
-// settings.gradle.kts / build.gradle.kts
 repositories {
     maven {
         url = uri("https://maven.pkg.github.com/WangTianYou537/CodeEditor")
@@ -408,11 +469,13 @@ grammars/                      same files at project root (dev / loadFromDirecto
 test/                          CoreTest, GrammarTest, LspTest (plain JDK)
 scripts/fetch-android-platform.sh
 scripts/build-demo-apk.sh
-scripts/build-jar.sh           library JAR + sources + POM + local Maven repo
+scripts/build-jar.sh           library JAR + sources + javadoc + POM + local Maven repo
 scripts/publish-github-packages.sh
+scripts/publish-maven-central.sh  GPG-sign + Central Portal bundle / upload
 .github/workflows/ci.yml       test + package on push/PR
-.github/workflows/release.yml  tag → GitHub Release + GitHub Packages
+.github/workflows/release.yml  tag → GitHub Release + Packages + Maven Central
 VERSION                        default package version (overridden by tag / env)
+LICENSE                        Apache-2.0
 build.sh                       compile + test entry point
 android-sdk/                   local only (gitignored) — platform android.jar
 build/                         local only (gitignored) — class output

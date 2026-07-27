@@ -10,6 +10,7 @@
 # Outputs (gitignored under dist/):
 #   dist/codeeditor-<ver>.jar
 #   dist/codeeditor-<ver>-sources.jar
+#   dist/codeeditor-<ver>-javadoc.jar
 #   dist/codeeditor-<ver>.pom
 #   dist/maven-repo/   (local Maven layout for file:// installs)
 set -euo pipefail
@@ -19,6 +20,7 @@ ANDROID_JAR="${ANDROID_JAR:-$ROOT/android-sdk/platforms/android-35/android.jar}"
 GROUP_ID="${GROUP_ID:-cn.wty5}"
 ARTIFACT_ID="${ARTIFACT_ID:-codeeditor}"
 SKIP_TESTS="${SKIP_TESTS:-0}"
+SKIP_JAVADOC="${SKIP_JAVADOC:-0}"
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -59,14 +61,16 @@ fi
 
 CLASSES="$ROOT/build/jar-classes"
 SRC_STAGING="$ROOT/build/jar-sources"
+JAVADOC_OUT="$ROOT/build/jar-javadoc"
 DIST="$ROOT/dist"
 JAR_NAME="${ARTIFACT_ID}-${VERSION}.jar"
 SOURCES_NAME="${ARTIFACT_ID}-${VERSION}-sources.jar"
+JAVADOC_NAME="${ARTIFACT_ID}-${VERSION}-javadoc.jar"
 POM_NAME="${ARTIFACT_ID}-${VERSION}.pom"
 
 mkdir -p "$DIST"
-rm -rf "$CLASSES" "$SRC_STAGING"
-mkdir -p "$CLASSES" "$SRC_STAGING"
+rm -rf "$CLASSES" "$SRC_STAGING" "$JAVADOC_OUT"
+mkdir -p "$CLASSES" "$SRC_STAGING" "$JAVADOC_OUT"
 
 echo "== version: $VERSION =="
 echo "== groupId: $GROUP_ID  artifactId: $ARTIFACT_ID =="
@@ -128,7 +132,50 @@ cp "$CLASSES/grammars/"*.json "$SRC_STAGING/grammars/"
   jar cf "$DIST/$SOURCES_NAME" .
 )
 
-# ---- POM -------------------------------------------------------------------
+# ---- javadoc JAR (required by Maven Central) --------------------------------
+if [[ "$SKIP_JAVADOC" != "1" ]]; then
+  echo "== javadoc jar $JAVADOC_NAME =="
+  # Android types are only needed as symbols; -Xdoclint:none keeps missing
+  # @param tags from failing the build. Link offline is skipped (no package-list).
+  set +e
+  javadoc \
+    --release 17 \
+    -quiet \
+    -encoding UTF-8 \
+    -charset UTF-8 \
+    -Xdoclint:none \
+    -cp "$ANDROID_JAR" \
+    -d "$JAVADOC_OUT" \
+    -sourcepath "$ROOT/src/main/java" \
+    -subpackages cn.wty5.editor \
+    @"$ROOT/build/lib-src.txt" \
+    >"$ROOT/build/javadoc.log" 2>&1
+  javadoc_rc=$?
+  set -e
+  if [[ $javadoc_rc -ne 0 ]]; then
+    echo "warning: javadoc exited $javadoc_rc — see build/javadoc.log" >&2
+    # Still produce a minimal jar so Central packaging can proceed; empty
+    # packages are rejected, so fall back to a placeholder index if needed.
+    if [[ ! -f "$JAVADOC_OUT/index.html" ]]; then
+      mkdir -p "$JAVADOC_OUT"
+      cat > "$JAVADOC_OUT/index.html" <<'HTML'
+<!DOCTYPE html><html><head><title>CodeEditor</title></head>
+<body><h1>CodeEditor</h1>
+<p>See sources JAR and
+<a href="https://github.com/WangTianYou537/CodeEditor">GitHub</a>.</p>
+</body></html>
+HTML
+    fi
+  fi
+  (
+    cd "$JAVADOC_OUT"
+    jar cf "$DIST/$JAVADOC_NAME" .
+  )
+else
+  echo "== javadoc skipped (SKIP_JAVADOC=1) =="
+fi
+
+# ---- POM (Maven Central–ready metadata) ------------------------------------
 echo "== pom $POM_NAME =="
 cat > "$DIST/$POM_NAME" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -141,8 +188,9 @@ cat > "$DIST/$POM_NAME" <<EOF
   <version>${VERSION}</version>
   <packaging>jar</packaging>
   <name>CodeEditor</name>
-  <description>High-performance Android code editor widget (piece table, grammar languages, LSP, no EditText).</description>
+  <description>High-performance Android code editor widget built from scratch in Java (piece table, grammar languages, LSP, no EditText/Spannable).</description>
   <url>https://github.com/WangTianYou537/CodeEditor</url>
+  <inceptionYear>2026</inceptionYear>
   <licenses>
     <license>
       <name>The Apache Software License, Version 2.0</name>
@@ -153,6 +201,7 @@ cat > "$DIST/$POM_NAME" <<EOF
   <developers>
     <developer>
       <id>WangTianYou537</id>
+      <name>WangTianYou537</name>
       <url>https://github.com/WangTianYou537</url>
     </developer>
   </developers>
@@ -160,7 +209,12 @@ cat > "$DIST/$POM_NAME" <<EOF
     <connection>scm:git:https://github.com/WangTianYou537/CodeEditor.git</connection>
     <developerConnection>scm:git:ssh://git@github.com/WangTianYou537/CodeEditor.git</developerConnection>
     <url>https://github.com/WangTianYou537/CodeEditor</url>
+    <tag>v${VERSION}</tag>
   </scm>
+  <issueManagement>
+    <system>GitHub</system>
+    <url>https://github.com/WangTianYou537/CodeEditor/issues</url>
+  </issueManagement>
   <!-- No third-party deps. Host app supplies the Android framework. -->
   <dependencies/>
   <properties>
@@ -179,15 +233,18 @@ mkdir -p "$ARTIFACT_DIR"
 cp "$DIST/$JAR_NAME"     "$ARTIFACT_DIR/"
 cp "$DIST/$SOURCES_NAME" "$ARTIFACT_DIR/"
 cp "$DIST/$POM_NAME"     "$ARTIFACT_DIR/"
+[[ -f "$DIST/$JAVADOC_NAME" ]] && cp "$DIST/$JAVADOC_NAME" "$ARTIFACT_DIR/"
 
 # Checksums (sha1 / md5) for local repo consumers that validate them.
+ARTIFACT_FILES=("$JAR_NAME" "$SOURCES_NAME" "$POM_NAME")
+[[ -f "$DIST/$JAVADOC_NAME" ]] && ARTIFACT_FILES+=("$JAVADOC_NAME")
 if command -v sha1sum >/dev/null 2>&1; then
-  for f in "$JAR_NAME" "$SOURCES_NAME" "$POM_NAME"; do
+  for f in "${ARTIFACT_FILES[@]}"; do
     ( cd "$ARTIFACT_DIR" && sha1sum "$f" | awk '{print $1}' > "${f}.sha1" )
   done
 fi
 if command -v md5sum >/dev/null 2>&1; then
-  for f in "$JAR_NAME" "$SOURCES_NAME" "$POM_NAME"; do
+  for f in "${ARTIFACT_FILES[@]}"; do
     ( cd "$ARTIFACT_DIR" && md5sum "$f" | awk '{print $1}' > "${f}.md5" )
   done
 fi
@@ -195,6 +252,7 @@ fi
 echo
 echo "OK  $DIST/$JAR_NAME  ($(du -h "$DIST/$JAR_NAME" | awk '{print $1}'))"
 echo "    $DIST/$SOURCES_NAME"
+[[ -f "$DIST/$JAVADOC_NAME" ]] && echo "    $DIST/$JAVADOC_NAME"
 echo "    $DIST/$POM_NAME"
 echo "    local Maven repo: $REPO_ROOT"
 echo
@@ -205,3 +263,6 @@ echo "  implementation \"$GROUP_ID:$ARTIFACT_ID:$VERSION\""
 echo
 echo "  # or copy the jar"
 echo "  implementation files(\"$DIST/$JAR_NAME\")"
+echo
+echo "Publish to Maven Central:"
+echo "  ./scripts/publish-maven-central.sh"

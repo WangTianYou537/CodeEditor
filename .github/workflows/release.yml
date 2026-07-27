@@ -16,6 +16,11 @@ on:
         required: false
         type: boolean
         default: false
+      publish_central:
+        description: "Also publish to Maven Central (needs secrets)"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -65,7 +70,7 @@ jobs:
         if: steps.cache-android.outputs.cache-hit != 'true'
         run: ./scripts/fetch-android-platform.sh 35
 
-      - name: Build JAR + sources + POM
+      - name: Build JAR + sources + javadoc + POM
         run: ./scripts/build-jar.sh
         env:
           VERSION: ${{ steps.ver.outputs.version }}
@@ -78,6 +83,29 @@ jobs:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+        continue-on-error: true
+
+      - name: Publish to Maven Central
+        # Skips cleanly when secrets are not configured. Manual dispatch can
+        # set publish_central=false to force-skip even with secrets present.
+        if: github.event_name == 'push' || inputs.publish_central
+        run: |
+          if [[ -z "${CENTRAL_USERNAME:-}" || -z "${GPG_PRIVATE_KEY:-}" ]]; then
+            echo "Maven Central secrets not configured — skipping Central publish."
+            echo "Set repo secrets: CENTRAL_USERNAME, CENTRAL_PASSWORD,"
+            echo "  GPG_PRIVATE_KEY, GPG_PASSPHRASE, GPG_KEY_ID"
+            exit 0
+          fi
+          ./scripts/publish-maven-central.sh --upload --wait
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          SKIP_BUILD: "1"
+          CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          CENTRAL_PUBLISHING_TYPE: AUTOMATIC
 
       - name: Ensure git tag exists (workflow_dispatch)
         if: github.event_name == 'workflow_dispatch'
@@ -102,6 +130,9 @@ jobs:
           files: |
             dist/codeeditor-${{ steps.ver.outputs.version }}.jar
             dist/codeeditor-${{ steps.ver.outputs.version }}-sources.jar
+            dist/codeeditor-${{ steps.ver.outputs.version }}-javadoc.jar
             dist/codeeditor-${{ steps.ver.outputs.version }}.pom
+            dist/codeeditor-${{ steps.ver.outputs.version }}-central-bundle.zip
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
