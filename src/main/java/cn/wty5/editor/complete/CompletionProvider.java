@@ -8,7 +8,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.TreeSet;
+import java.util.HashSet;
 
 /**
  * Completion sources driven by a {@link LanguageSpec}: keywords, types,
