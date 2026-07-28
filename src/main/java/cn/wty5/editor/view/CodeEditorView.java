@@ -2159,7 +2159,10 @@ public class CodeEditorView extends View
         float baseline = top + baselineShift;
         float bottom = top + lineHeight;
         int flags = CursorAnchorInfo.FLAG_HAS_VISIBLE_REGION;
-        if (markerX < 0 || markerX > getWidth() || bottom < 0 || top > getHeight()) {
+        // The line-number gutter is painted over [0, gutterWidth); a marker in
+        // that band is occluded, so report it as invisible to the IME.
+        if (markerX < gutterWidth || markerX > getWidth()
+                || bottom < 0 || top > getHeight()) {
             flags = CursorAnchorInfo.FLAG_HAS_INVISIBLE_REGION;
         }
         b.setInsertionMarkerLocation(markerX, top, baseline, bottom, flags);
