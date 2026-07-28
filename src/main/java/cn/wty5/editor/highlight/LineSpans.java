@@ -50,7 +50,9 @@ public final class LineSpans {
         return ends[i];
     }
 
+    private static final TokenType[] TOKEN_TYPES = TokenType.values();
+
     public TokenType type(int i) {
-        return TokenType.values()[types[i]];
+        return TOKEN_TYPES[types[i]];
     }
 }

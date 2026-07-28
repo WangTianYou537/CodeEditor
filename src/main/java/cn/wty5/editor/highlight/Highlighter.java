@@ -97,9 +97,7 @@ public final class Highlighter implements Document.ContentListener {
 
     public void invalidateAll() {
         lines.clear();
-        for (int i = 0, n = document.lineCount(); i < n; i++) {
-            lines.add(null);
-        }
+        lines.addAll(java.util.Collections.nCopies(document.lineCount(), null));
         if (document.lineCount() > 0) {
             markDirty(0, document.lineCount() - 1);
         }

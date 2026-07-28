@@ -2377,12 +2377,16 @@ public class CodeEditorView extends View
     // Auto-indent
     // ------------------------------------------------------------------
 
-    /** One indent step: currently four spaces (matches TAB_SIZE). */
-    private String indentUnit() {
-        // Keep in sync with TAB_SIZE so tab stops and indent levels agree.
+    private static final String INDENT_UNIT;
+    static {
         char[] unit = new char[TAB_SIZE];
         Arrays.fill(unit, ' ');
-        return new String(unit);
+        INDENT_UNIT = new String(unit);
+    }
+
+    /** One indent step: currently four spaces (matches TAB_SIZE). */
+    private String indentUnit() {
+        return INDENT_UNIT;
     }
 
     private static boolean isIndentWs(char c) {

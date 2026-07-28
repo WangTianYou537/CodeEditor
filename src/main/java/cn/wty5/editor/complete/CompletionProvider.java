@@ -66,6 +66,7 @@ public final class CompletionProvider {
 
         LanguageSpec lang = this.language;
         List<Scored> scored = new ArrayList<>();
+
         String lowerPrefix = prefix.toLowerCase();
 
         if (lang != null) {
@@ -105,7 +106,7 @@ public final class CompletionProvider {
 
         scored.sort((a, b) -> Integer.compare(b.score, a.score));
         List<CompletionItem> out = new ArrayList<>(Math.min(scored.size(), 20));
-        TreeSet<String> seen = new TreeSet<>();
+        HashSet<String> seen = new HashSet<>();
         for (Scored s : scored) {
             if (seen.add(s.item.label)) {
                 out.add(s.item);

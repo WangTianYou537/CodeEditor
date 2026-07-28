@@ -78,11 +78,12 @@ public final class Document implements CharSequence {
         if (oldLen > 0) {
             delete(0, oldLen);
         }
-        table = new PieceTable(text == null ? "" : text);
+        String content = text == null ? "" : text;
+        table = new PieceTable(content);
         version++;
         if (table.length() > 0) {
             for (ContentListener l : listeners) {
-                l.onInsert(this, 0, table.toString());
+                l.onInsert(this, 0, content);
             }
         }
     }
