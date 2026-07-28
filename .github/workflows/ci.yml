@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    name: Test + package JAR
+    name: Test + package JAR & APK
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -37,6 +37,11 @@ jobs:
           # CI builds of untagged commits publish as SNAPSHOT-like local only.
           VERSION: 0.0.0-ci
 
+      - name: Build Demo APK
+        run: |
+          chmod +x scripts/build-demo-apk.sh
+          ./scripts/build-demo-apk.sh
+
       - name: Upload JAR artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -44,4 +49,11 @@ jobs:
           path: |
             dist/codeeditor-*.jar
             dist/codeeditor-*.pom
+          if-no-files-found: error
+
+      - name: Upload Demo APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeeditor-demo-apk
+          path: dist/CodeEditor-demo.apk
           if-no-files-found: error
